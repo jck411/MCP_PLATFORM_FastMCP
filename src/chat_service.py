@@ -168,6 +168,7 @@ class ChatService:
         if not self.tool_mgr:
             return base
 
+        # Add available resources information
         if self._resource_catalog:
             cat = "\n".join(f"• {uri}" for uri in self._resource_catalog)
             base += (
@@ -176,27 +177,19 @@ class ChatService:
                 f"{cat}"
             )
 
-        # inject *static* prompts that require no arguments, once:
-        for name in self.tool_mgr.list_available_prompts():
-            pinfo = self.tool_mgr.get_prompt_info(name)
-            if pinfo and not pinfo.prompt.arguments:  # no params → safe to inline
-                try:
-                    # Create new event loop for sync context
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    fetched = loop.run_until_complete(
-                        self.tool_mgr.get_prompt(name)
-                    )
-                    loop.close()
+        # Add available prompts information
+        prompt_names = self.tool_mgr.list_available_prompts()
+        if prompt_names:
+            prompt_list = []
+            for name in prompt_names:
+                pinfo = self.tool_mgr.get_prompt_info(name)
+                if pinfo:
+                    desc = pinfo.prompt.description or "No description available"
+                    prompt_list.append(f"• **{name}**: {desc}")
 
-                    msgs = "\n".join(
-                        m.content.text
-                        for m in fetched.messages
-                        if isinstance(m.content, types.TextContent)
-                    )
-                    base += f"\n\n### Reference prompt «{name}»\n{msgs}"
-                except Exception as e:
-                    logger.warning(f"Failed to inline prompt '{name}': {e}")
+            prompts_text = "\n".join(prompt_list)
+            base += f"\n\nAvailable prompts (use apply_prompt method):\n{prompts_text}"
+
         return base
 
     @staticmethod
