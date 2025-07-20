@@ -32,8 +32,19 @@ line-length = 88
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "C4"]
-ignore = []
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings  
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "C4",  # flake8-comprehensions
+]
+ignore = [
+    "E203", # whitespace before ':' (conflicts with black)
+]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -45,8 +56,5 @@ mcp-simple-tool = { path = "Servers/simple-tool", editable = true }
 
 [dependency-groups]
 dev = [
-    "black>=25.1.0",
-    "flake8>=7.3.0",
-    "isort>=6.0.1",
     "pre-commit>=4.2.0",
 ]
