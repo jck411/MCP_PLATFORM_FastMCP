@@ -17,12 +17,10 @@ from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any
 
 import mcp.types as types
-from mcp import McpError
 
 if TYPE_CHECKING:
     from src.main import LLMClient, MCPClient
-
-from src.tool_schema_manager import ToolSchemaManager
+    from src.tool_schema_manager import ToolSchemaManager
 
 logger = logging.getLogger(__name__)
 
@@ -31,22 +29,17 @@ class ChatMessage:
     """Represents a chat message with metadata."""
 
     def __init__(
-        self, message_type: str, content: Any, metadata: dict[str, Any] | None = None
+        self, mtype: str, content: str, meta: dict[str, Any] | None = None
     ):
-        self.type = message_type
+        self.type = mtype
         self.content = content
-        self.metadata = metadata or {}
+        self.meta = meta or {}
+        # Maintain backward compatibility with existing code
+        self.metadata = self.meta
 
 
 class ChatService:
-    """
-    Main chat service that handles conversation logic and MCP coordination.
-
-    This service is responsible for:
-    - Managing conversation state with a built-in default system prompt
-    - Coordinating between MCP clients and LLM
-    - Executing tools and processing results
-    """
+    """Conversation orchestrator – recommended pattern (no virtual prompt tools)."""
 
     def __init__(
         self,
@@ -57,433 +50,178 @@ class ChatService:
         self.clients = clients
         self.llm_client = llm_client
         self.config = config
+        self.chat_conf = config.get("chat", {}).get("service", {})
+        self.tool_mgr: ToolSchemaManager | None = None
+        self._init_lock = asyncio.Lock()
+        self._ready = asyncio.Event()
 
-        # Extract chat service specific config
-        self.chat_config = config.get("chat", {}).get("service", {})
-
-        self.tool_schema_manager = ToolSchemaManager(clients)
-        self._initialized = False
-
-    def _get_resource_tools(self) -> list[dict[str, Any]]:
-        """Create virtual tools for reading resources."""
-        resource_tools = []
-
-        # Add a general resource reader tool
-        resource_descriptions = self.tool_schema_manager.get_resource_descriptions()
-        if resource_descriptions:
-            resource_tools.append({
-                "type": "function",
-                "function": {
-                    "name": "read_resource",
-                    "description": "Read the content of an available MCP resource",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "uri": {
-                                "type": "string",
-                                "description": "Resource URI to read"
-                            }
-                        },
-                        "required": ["uri"]
-                    }
-                }
-            })
-
-        return resource_tools
-
-    def _get_prompt_tools(self) -> list[dict[str, Any]]:
-        """Create virtual tools for using prompts."""
-        prompt_tools = []
-
-        # Get all available prompts and create individual tools for each
-        prompt_names = self.tool_schema_manager.list_available_prompts()
-        for prompt_name in prompt_names:
-            prompt_info = self.tool_schema_manager.get_prompt_info(prompt_name)
-            if prompt_info:
-                prompt = prompt_info.prompt
-
-                # Build parameters from prompt arguments
-                parameters = {
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }
-
-                if prompt.arguments:
-                    for arg in prompt.arguments:
-                        parameters["properties"][arg.name] = {
-                            "type": "string",  # MCP prompt args are typically strings
-                            "description": arg.description or f"Argument: {arg.name}"
-                        }
-                        if arg.required:
-                            parameters["required"].append(arg.name)
-
-                prompt_tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": f"use_prompt_{prompt_name}",
-                        "description": (
-                            f"Use prompt: {prompt.description or prompt_name}"
-                        ),
-                        "parameters": parameters
-                    }
-                })
-
-        return prompt_tools
-
-    def _build_system_prompt(self) -> str:
-        """Build the system prompt using configuration."""
-        return self.chat_config["system_prompt"]
+    # ─────────────────────────── Public API ───────────────────────────────────
 
     async def initialize(self) -> None:
         """Initialize the chat service and all MCP clients."""
-        if self._initialized:
-            return
+        async with self._init_lock:
+            if self._ready.is_set():
+                return
 
-        # Connect all MCP clients with health monitoring
-        connection_tasks = []
-        for client in self.clients:
-            connection_tasks.append(self._connect_with_health_check(client))
+            # 1. connect clients (fail‑soft)
+            await asyncio.gather(
+                *(c.connect() for c in self.clients), return_exceptions=True
+            )
 
-        # Wait for all connections to complete
-        await asyncio.gather(*connection_tasks)
+            # 2. build managers / caches
+            from src.tool_schema_manager import ToolSchemaManager  # late import
 
-        # Initialize tool schema manager
-        await self.tool_schema_manager.initialize()
+            self.tool_mgr = ToolSchemaManager(self.clients)
+            await self.tool_mgr.initialize()
 
-        # Log initialization
-        metadata = self.tool_schema_manager.export_schema_metadata()
-        logger.info(
-            f"Chat service initialized with {metadata['tool_count']} tools "
-            f"from {metadata['client_count']} clients"
-        )
+            # 3. prime immutable data
+            self._resource_catalog = sorted(
+                self.tool_mgr.get_resource_descriptions()
+            )
+            self._system_prompt = self._make_system_prompt()
 
-        self._initialized = True
-
-    async def _connect_with_health_check(self, client: MCPClient) -> None:
-        """Connect a client and perform health check."""
-        try:
-            await client.connect()
-
-            # Perform health check
-            if await client.ping():
-                logger.info(f"Client '{client.name}' health check passed")
-            else:
-                logger.warning(f"Client '{client.name}' health check failed")
-
-        except Exception as e:
-            logger.error(f"Failed to connect client '{client.name}': {e}")
-            # Don't raise - allow service to start with partial client connectivity
+            logger.info(
+                "ChatService ready: %d tools, %d resources, %d prompts",
+                len(self.tool_mgr.get_openai_tools()),
+                len(self._resource_catalog),
+                len(self.tool_mgr.list_available_prompts()),
+            )
+            self._ready.set()
 
     async def cleanup(self) -> None:
         """Clean up all resources."""
-        for client in self.clients:
-            try:
-                await client.close()
-            except Exception as e:
-                logger.warning(f"Error closing client '{client.name}': {e}")
+        for c in self.clients:
+            await c.close()
+        self._ready.clear()
 
-        self._initialized = False
-
-    async def process_message(
-        self, user_message: str, conversation_history: list[dict[str, Any]]
+    async def process_message(  # <- main entry
+        self,
+        user_msg: str,
+        history: list[dict[str, Any]],
     ) -> AsyncGenerator[ChatMessage, None]:
-        """
-        Process a user message and yield response chunks.
+        """Process a user message and yield response chunks."""
+        await self._ready.wait()
 
-        This method handles the complete conversation flow:
-        1. Use default system prompt
-        2. Get LLM response
-        3. If tool is called, execute tool and get final response
-        """
-        if not self._initialized:
-            raise RuntimeError("Chat service not initialized")
+        # Ensure tool_mgr is available
+        if not self.tool_mgr:
+            raise RuntimeError("Tool manager not initialized")
 
-        # Use default system prompt
-        messages = [
-            {
-                "role": "system",
-                "content": self._build_system_prompt(),
-            }
+        # ---- 0 · prepare conversation ---------------------------------------
+        conv = [
+            {"role": "system", "content": self._system_prompt},
+            *history,
+            {"role": "user", "content": user_msg},
         ]
-        messages.extend(conversation_history)
-        messages.append({"role": "user", "content": user_message})
 
-        # Get available tools
-        tools = self.tool_schema_manager.get_openai_tools()
+        tools_payload = self.tool_mgr.get_openai_tools()
 
-        # Add resource reading capability as a virtual tool
-        resource_tools = self._get_resource_tools()
-        tools.extend(resource_tools)
+        # ---- 1 · first LLM pass ---------------------------------------------
+        reply = await self.llm_client.get_response_with_tools(conv, tools_payload)
+        assistant_msg = reply["message"]
 
-        # Add prompt usage capability as virtual tools
-        prompt_tools = self._get_prompt_tools()
-        tools.extend(prompt_tools)
-
-        try:
-            # Get LLM response
-            llm_response = await self.llm_client.get_response_with_tools(
-                messages, tools if tools else None
-            )
-
-            # Handle structured response format
-            message = llm_response.get("message", {})
-            tool_calls = message.get("tool_calls", [])
-
-            # Yield text content if available
-            if message.get("content"):
-                yield ChatMessage(
-                    "text",
-                    message["content"],
-                    {"finish_reason": llm_response.get("finish_reason")},
-                )
-
-            # Process tool calls if any
-            if tool_calls:
-                # Add assistant message with tool calls to history
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": message.get("content") or "",
-                        "tool_calls": tool_calls,
-                    }
-                )
-
-                async for tool_message in self._process_tool_calls(
-                    tool_calls, messages
-                ):
-                    yield tool_message
-
-        except Exception as e:
-            logger.error(f"Error processing message: {e}")
+        # Emit text content if available
+        if txt := assistant_msg.get("content"):
             yield ChatMessage(
-                "error",
-                f"An error occurred while processing your message: {str(e)}",
-                {"error_type": type(e).__name__},
+                "text", txt, {"finish_reason": assistant_msg.get("finish_reason")}
             )
 
-    async def _process_tool_calls(
-        self, tool_calls: list[dict[str, Any]], messages: list[dict[str, Any]]
-    ) -> AsyncGenerator[ChatMessage, None]:
-        """Process tool calls and yield results."""
-
-        for tool_call in tool_calls:
-            tool_name = tool_call["function"]["name"]
-            tool_args = json.loads(tool_call["function"]["arguments"])
-
-            # Check if tool notifications are enabled
-            tool_notifications = self.chat_config["tool_notifications"]
-            if tool_notifications["enabled"]:
-                # Get configurable notification format
-                icon = tool_notifications["icon"]
-                format_template = tool_notifications["format"]
-
-                notification_text = format_template.format(
-                    icon=icon,
-                    tool_name=tool_name,
-                    tool_args=(
-                        tool_args if tool_notifications["show_args"] else ""
-                    )
-                )
-
-                # Yield tool execution notification
-                if self.chat_config["logging"]["tool_execution"]:
-                    logger.info(
-                        f"Yielding tool execution message for tool: {tool_name}"
-                    )
-
-                yield ChatMessage(
-                    "tool_execution",
-                    notification_text,
-                    {"tool_name": tool_name, "tool_args": tool_args},
-                )
-
-            # Execute the tool
-            tool_result = await self._execute_tool_call(tool_name, tool_args)
-
-            # Log tool result if logging is enabled
-            if self.chat_config["logging"]["tool_execution"]:
-                truncate_length = self.chat_config["logging"]["result_truncate_length"]
-                logger.info(
-                    f"Tool result for {tool_name}: {tool_result[:truncate_length]}..."
-                )
-
-            # Add tool result to message history
-            messages.append(
+        # ---- 2 · handle tool calls loop -------------------------------------
+        while calls := assistant_msg.get("tool_calls"):
+            conv.append(
                 {
-                    "role": "tool",
-                    "content": tool_result,
-                    "tool_call_id": tool_call["id"],
+                    "role": "assistant",
+                    "content": assistant_msg.get("content") or "",
+                    "tool_calls": calls,
                 }
             )
 
-        # Get final response from LLM (keeping the same system prompt)
-        try:
-            tools = self.tool_schema_manager.get_openai_tools()
-            final_response = await self.llm_client.get_response_with_tools(
-                messages, tools if tools else None
-            )
+            for call in calls:
+                tool_name = call["function"]["name"]
+                args = json.loads(call["function"]["arguments"] or "{}")
 
-            # Handle the final response
-            final_message = final_response.get("message", {})
-            if final_message.get("content"):
+                result = await self.tool_mgr.call_tool(tool_name, args)
+                conv.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "content": self._pluck_text(result),
+                    }
+                )
+
+            assistant_msg = (
+                await self.llm_client.get_response_with_tools(conv, tools_payload)
+            )["message"]
+
+            # Emit text content if available
+            if txt := assistant_msg.get("content"):
                 yield ChatMessage(
-                    "text",
-                    final_message["content"],
-                    {"finish_reason": final_response.get("finish_reason")},
+                    "text", txt, {"finish_reason": assistant_msg.get("finish_reason")}
                 )
 
-        except Exception as e:
-            logger.error(f"Error getting final response after tool calls: {e}")
-            yield ChatMessage(
-                "error",
-                f"Error getting final response: {str(e)}",
-                {"error_type": type(e).__name__},
+    # ───────────────────────── Helper methods ────────────────────────────────
+
+    def _make_system_prompt(self) -> str:
+        """Static system prompt containing resource catalogue & house rules."""
+        base = self.chat_conf["system_prompt"].rstrip()
+
+        # Ensure tool_mgr is available
+        if not self.tool_mgr:
+            return base
+
+        if self._resource_catalog:
+            cat = "\n".join(f"• {uri}" for uri in self._resource_catalog)
+            base += (
+                "\n\nAvailable knowledge base resources **(read‑only)**\n"
+                "Call the appropriate MCP tool if you need any of them:\n"
+                f"{cat}"
             )
 
-    async def _execute_tool_call(
-        self, tool_name: str, tool_args: dict[str, Any]
-    ) -> str:
-        """Execute a tool call and return the result."""
-        try:
-            if self.chat_config["logging"]["tool_execution"]:
-                logger.info(f"Executing tool '{tool_name}' with args: {tool_args}")
+        # inject *static* prompts that require no arguments, once:
+        for name in self.tool_mgr.list_available_prompts():
+            pinfo = self.tool_mgr.get_prompt_info(name)
+            if pinfo and not pinfo.prompt.arguments:  # no params → safe to inline
+                try:
+                    # Create new event loop for sync context
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    fetched = loop.run_until_complete(
+                        self.tool_mgr.get_prompt(name)
+                    )
+                    loop.close()
 
-            # Handle virtual resource reading tool
-            if tool_name == "read_resource":
-                uri = tool_args.get("uri")
-                if not uri:
-                    return "Error: No URI provided for resource reading"
+                    msgs = "\n".join(
+                        m.content.text
+                        for m in fetched.messages
+                        if isinstance(m.content, types.TextContent)
+                    )
+                    base += f"\n\n### Reference prompt «{name}»\n{msgs}"
+                except Exception as e:
+                    logger.warning(f"Failed to inline prompt '{name}': {e}")
+        return base
 
-                result = await self.tool_schema_manager.read_resource(uri)
-
-                if self.chat_config["logging"]["tool_execution"]:
-                    logger.info(f"Read resource '{uri}' successfully")
-
-                extracted_content = self._extract_resource_content(result)
-                return extracted_content
-
-            # Handle virtual prompt usage tools
-            if tool_name.startswith("use_prompt_"):
-                prompt_name = tool_name[11:]  # Remove "use_prompt_" prefix
-
-                if self.chat_config["logging"]["tool_execution"]:
-                    logger.info(f"Using prompt '{prompt_name}' with args: {tool_args}")
-
-                result = await self.tool_schema_manager.get_prompt(
-                    prompt_name, tool_args or {}
-                )
-
-                if self.chat_config["logging"]["tool_execution"]:
-                    logger.info(f"Retrieved prompt '{prompt_name}' successfully")
-
-                # Extract and format prompt messages
-                extracted_content = self._extract_prompt_messages(result)
-                return extracted_content
-
-            # Handle regular MCP tools
-            result = await self.tool_schema_manager.call_tool(tool_name, tool_args)
-
-            if self.chat_config["logging"]["tool_execution"]:
-                logger.info(f"Raw tool result: {result}")
-
-            extracted_content = self._extract_content_from_result(result)
-
-            if self.chat_config["logging"]["tool_execution"]:
-                truncate_length = self.chat_config["logging"]["result_truncate_length"]
-                logger.info(
-                    f"Extracted content: {extracted_content[:truncate_length]}..."
-                )
-
-            return extracted_content
-        except McpError as e:
-            error_msg = f"MCP error executing tool '{tool_name}': {e.error.message}"
-            logger.error(error_msg)
-            return error_msg
-        except Exception as e:
-            error_msg = f"Error executing tool '{tool_name}': {str(e)}"
-            logger.error(error_msg)
-            return error_msg
-
-    def _get_system_message(self) -> str:
-        """Get system message directly."""
-        return self._build_system_prompt()
-
-    def _extract_content_from_result(self, result: types.CallToolResult) -> str:
+    @staticmethod
+    def _pluck_text(res: types.CallToolResult) -> str:
         """Extract text content from a tool call result."""
-        if not result.content:
-            return "Tool executed successfully (no content returned)"
-
-        content_parts = []
-        for content_item in result.content:
-            # Check the actual type and extract accordingly
-            if isinstance(content_item, types.TextContent):
-                content_parts.append(content_item.text)
-            elif isinstance(content_item, types.ImageContent):
-                content_parts.append(f"[Image: {content_item.mimeType}]")
-            elif isinstance(content_item, types.AudioContent):
-                content_parts.append(f"[Audio: {content_item.mimeType}]")
+        if not res.content:
+            return "✓ done"
+        out: list[str] = []
+        for item in res.content:
+            if isinstance(item, types.TextContent):
+                out.append(item.text)
             else:
-                # Handle other content types safely
-                data = getattr(content_item, "data", None)
-                if data is not None:
-                    try:
-                        content_parts.append(f"[Binary data: {len(data)} bytes]")
-                    except (TypeError, AttributeError):
-                        content_parts.append(f"[{type(content_item).__name__}]")
-                else:
-                    content_parts.append(str(content_item))
+                out.append(f"[{type(item).__name__}]")
+        return "\n".join(out)
 
-        return "\n".join(content_parts) if content_parts else "No readable content"
+    # ───────────────────────── Utility methods ──────────────────────────────
 
-    def _extract_resource_content(self, result: types.ReadResourceResult) -> str:
-        """Extract text content from a resource read result."""
-        if not result.contents:
-            return "Resource is empty or not accessible"
+    async def apply_prompt(self, name: str, args: dict[str, str]) -> list[dict]:
+        """Apply a parameterized prompt and return conversation messages."""
+        if not self.tool_mgr:
+            raise RuntimeError("Tool manager not initialized")
 
-        content_parts = []
-        for content_item in result.contents:
-            # Handle different resource content types using isinstance
-            if isinstance(content_item, types.TextResourceContents):
-                content_parts.append(content_item.text)
-            elif isinstance(content_item, types.BlobResourceContents):
-                blob_length = len(content_item.blob) if content_item.blob else 0
-                content_parts.append(f"[Binary content: {blob_length} bytes]")
-            else:
-                content_parts.append(str(content_item))
-
-        return "\n".join(content_parts) if content_parts else "No readable content"
-
-    def _extract_prompt_messages(self, result: types.GetPromptResult) -> str:
-        """Extract and format messages from a prompt result."""
-        if not result.messages:
-            return "Prompt has no messages"
-
-        formatted_messages = []
-        for message in result.messages:
-            # Extract role and content from PromptMessage
-            role = message.role
-
-            # Handle content based on its type
-            if isinstance(message.content, types.TextContent):
-                content = message.content.text
-            elif isinstance(message.content, types.ImageContent):
-                content = f"[Image: {message.content.mimeType}]"
-            elif isinstance(message.content, list):
-                # Handle list of content items
-                content_parts = []
-                for item in message.content:
-                    if isinstance(item, types.TextContent):
-                        content_parts.append(item.text)
-                    elif isinstance(item, types.ImageContent):
-                        content_parts.append(f"[Image: {item.mimeType}]")
-                    else:
-                        content_parts.append(str(item))
-                content = "\n".join(content_parts)
-            else:
-                content = str(message.content)
-
-            formatted_messages.append(f"[{role.upper()}]: {content}")
-
-        result_text = "\n\n".join(formatted_messages)
-        return f"Prompt executed successfully:\n{result_text}"
+        res = await self.tool_mgr.get_prompt(name, args)
+        return [
+            {"role": m.role, "content": m.content.text}
+            for m in res.messages
+            if isinstance(m.content, types.TextContent)
+        ]
