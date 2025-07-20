@@ -4,7 +4,7 @@ Chat Service for MCP Platform
 This module handles the business logic for chat sessions, including:
 - Conversation management with simple default prompts
 - Tool orchestration
-- MCP client coordination  
+- MCP client coordination
 - LLM interactions
 """
 
@@ -57,17 +57,84 @@ class ChatService:
         self.clients = clients
         self.llm_client = llm_client
         self.config = config
-        
+
         # Extract chat service specific config
         self.chat_config = config.get("chat", {}).get("service", {})
-        
+
         self.tool_schema_manager = ToolSchemaManager(clients)
         self._initialized = False
+
+    def _get_resource_tools(self) -> list[dict[str, Any]]:
+        """Create virtual tools for reading resources."""
+        resource_tools = []
+
+        # Add a general resource reader tool
+        resource_descriptions = self.tool_schema_manager.get_resource_descriptions()
+        if resource_descriptions:
+            resource_tools.append({
+                "type": "function",
+                "function": {
+                    "name": "read_resource",
+                    "description": "Read the content of an available MCP resource",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "uri": {
+                                "type": "string",
+                                "description": "Resource URI to read"
+                            }
+                        },
+                        "required": ["uri"]
+                    }
+                }
+            })
+
+        return resource_tools
+
+    def _get_prompt_tools(self) -> list[dict[str, Any]]:
+        """Create virtual tools for using prompts."""
+        prompt_tools = []
+
+        # Get all available prompts and create individual tools for each
+        prompt_names = self.tool_schema_manager.list_available_prompts()
+        for prompt_name in prompt_names:
+            prompt_info = self.tool_schema_manager.get_prompt_info(prompt_name)
+            if prompt_info:
+                prompt = prompt_info.prompt
+
+                # Build parameters from prompt arguments
+                parameters = {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+
+                if prompt.arguments:
+                    for arg in prompt.arguments:
+                        parameters["properties"][arg.name] = {
+                            "type": "string",  # MCP prompt args are typically strings
+                            "description": arg.description or f"Argument: {arg.name}"
+                        }
+                        if arg.required:
+                            parameters["required"].append(arg.name)
+
+                prompt_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": f"use_prompt_{prompt_name}",
+                        "description": (
+                            f"Use prompt: {prompt.description or prompt_name}"
+                        ),
+                        "parameters": parameters
+                    }
+                })
+
+        return prompt_tools
 
     def _build_system_prompt(self) -> str:
         """Build the system prompt using configuration."""
         return self.chat_config["system_prompt"]
- 
+
     async def initialize(self) -> None:
         """Initialize the chat service and all MCP clients."""
         if self._initialized:
@@ -145,6 +212,14 @@ class ChatService:
         # Get available tools
         tools = self.tool_schema_manager.get_openai_tools()
 
+        # Add resource reading capability as a virtual tool
+        resource_tools = self._get_resource_tools()
+        tools.extend(resource_tools)
+
+        # Add prompt usage capability as virtual tools
+        prompt_tools = self._get_prompt_tools()
+        tools.extend(prompt_tools)
+
         try:
             # Get LLM response
             llm_response = await self.llm_client.get_response_with_tools(
@@ -202,7 +277,7 @@ class ChatService:
                 # Get configurable notification format
                 icon = tool_notifications["icon"]
                 format_template = tool_notifications["format"]
-                
+
                 notification_text = format_template.format(
                     icon=icon,
                     tool_name=tool_name,
@@ -210,13 +285,13 @@ class ChatService:
                         tool_args if tool_notifications["show_args"] else ""
                     )
                 )
-                
+
                 # Yield tool execution notification
                 if self.chat_config["logging"]["tool_execution"]:
                     logger.info(
                         f"Yielding tool execution message for tool: {tool_name}"
                     )
-                
+
                 yield ChatMessage(
                     "tool_execution",
                     notification_text,
@@ -225,7 +300,7 @@ class ChatService:
 
             # Execute the tool
             tool_result = await self._execute_tool_call(tool_name, tool_args)
-            
+
             # Log tool result if logging is enabled
             if self.chat_config["logging"]["tool_execution"]:
                 truncate_length = self.chat_config["logging"]["result_truncate_length"]
@@ -273,20 +348,53 @@ class ChatService:
         try:
             if self.chat_config["logging"]["tool_execution"]:
                 logger.info(f"Executing tool '{tool_name}' with args: {tool_args}")
-            
+
+            # Handle virtual resource reading tool
+            if tool_name == "read_resource":
+                uri = tool_args.get("uri")
+                if not uri:
+                    return "Error: No URI provided for resource reading"
+
+                result = await self.tool_schema_manager.read_resource(uri)
+
+                if self.chat_config["logging"]["tool_execution"]:
+                    logger.info(f"Read resource '{uri}' successfully")
+
+                extracted_content = self._extract_resource_content(result)
+                return extracted_content
+
+            # Handle virtual prompt usage tools
+            if tool_name.startswith("use_prompt_"):
+                prompt_name = tool_name[11:]  # Remove "use_prompt_" prefix
+
+                if self.chat_config["logging"]["tool_execution"]:
+                    logger.info(f"Using prompt '{prompt_name}' with args: {tool_args}")
+
+                result = await self.tool_schema_manager.get_prompt(
+                    prompt_name, tool_args or {}
+                )
+
+                if self.chat_config["logging"]["tool_execution"]:
+                    logger.info(f"Retrieved prompt '{prompt_name}' successfully")
+
+                # Extract and format prompt messages
+                extracted_content = self._extract_prompt_messages(result)
+                return extracted_content
+
+            # Handle regular MCP tools
             result = await self.tool_schema_manager.call_tool(tool_name, tool_args)
-            
+
             if self.chat_config["logging"]["tool_execution"]:
                 logger.info(f"Raw tool result: {result}")
-            
+
             extracted_content = self._extract_content_from_result(result)
-            
+
             if self.chat_config["logging"]["tool_execution"]:
                 truncate_length = self.chat_config["logging"]["result_truncate_length"]
                 logger.info(
                     f"Extracted content: {extracted_content[:truncate_length]}..."
                 )
-            
+
             return extracted_content
         except McpError as e:
             error_msg = f"MCP error executing tool '{tool_name}': {e.error.message}"
@@ -327,3 +435,55 @@ class ChatService:
                     content_parts.append(str(content_item))
 
         return "\n".join(content_parts) if content_parts else "No readable content"
+
+    def _extract_resource_content(self, result: types.ReadResourceResult) -> str:
+        """Extract text content from a resource read result."""
+        if not result.contents:
+            return "Resource is empty or not accessible"
+
+        content_parts = []
+        for content_item in result.contents:
+            # Handle different resource content types using isinstance
+            if isinstance(content_item, types.TextResourceContents):
+                content_parts.append(content_item.text)
+            elif isinstance(content_item, types.BlobResourceContents):
+                blob_length = len(content_item.blob) if content_item.blob else 0
+                content_parts.append(f"[Binary content: {blob_length} bytes]")
+            else:
+                content_parts.append(str(content_item))
+
+        return "\n".join(content_parts) if content_parts else "No readable content"
+
+    def _extract_prompt_messages(self, result: types.GetPromptResult) -> str:
+        """Extract and format messages from a prompt result."""
+        if not result.messages:
+            return "Prompt has no messages"
+
+        formatted_messages = []
+        for message in result.messages:
+            # Extract role and content from PromptMessage
+            role = message.role
+
+            # Handle content based on its type
+            if isinstance(message.content, types.TextContent):
+                content = message.content.text
+            elif isinstance(message.content, types.ImageContent):
+                content = f"[Image: {message.content.mimeType}]"
+            elif isinstance(message.content, list):
+                # Handle list of content items
+                content_parts = []
+                for item in message.content:
+                    if isinstance(item, types.TextContent):
+                        content_parts.append(item.text)
+                    elif isinstance(item, types.ImageContent):
+                        content_parts.append(f"[Image: {item.mimeType}]")
+                    else:
+                        content_parts.append(str(item))
+                content = "\n".join(content_parts)
+            else:
+                content = str(message.content)
+
+            formatted_messages.append(f"[{role.upper()}]: {content}")
+
+        result_text = "\n\n".join(formatted_messages)
+        return f"Prompt executed successfully:\n{result_text}"

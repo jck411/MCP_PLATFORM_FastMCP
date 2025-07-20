@@ -1,0 +1,61 @@
+{
+  "name": "Demo",
+  "instructions": null,
+  "fastmcp_version": "2.10.6",
+  "mcp_version": "1.12.0",
+  "server_version": "1.0",
+  "tools": [
+    {
+      "key": "sum",
+      "name": "sum",
+      "description": "Add two numbers",
+      "input_schema": {
+        "properties": {
+          "a": {
+            "title": "A",
+            "type": "integer"
+          },
+          "b": {
+            "title": "B",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "a",
+          "b"
+        ],
+        "title": "sumArguments",
+        "type": "object"
+      },
+      "annotations": null,
+      "tags": null,
+      "enabled": null
+    }
+  ],
+  "prompts": [],
+  "resources": [
+    {
+      "key": "dir://desktop",
+      "uri": "dir://desktop",
+      "name": "desktop",
+      "description": "List the files in the user's desktop",
+      "mime_type": "text/plain",
+      "tags": null,
+      "enabled": null
+    }
+  ],
+  "templates": [],
+  "capabilities": {
+    "tools": {
+      "listChanged": true
+    },
+    "resources": {
+      "subscribe": false,
+      "listChanged": false
+    },
+    "prompts": {
+      "listChanged": false
+    },
+    "logging": {}
+  }
+}

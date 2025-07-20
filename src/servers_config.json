@@ -1,4 +1,10 @@
 {
   "mcpServers": {
+    "demo": {
+      "command": "uv",
+      "args": ["run", "python", "Servers/demo_server.py"],
+      "env": {},
+      "cwd": "/home/jack/MCP_PLATFORM_FastMCP"
+    }
   }
 }
