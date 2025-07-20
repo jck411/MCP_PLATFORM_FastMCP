@@ -124,3 +124,11 @@ class Configuration:
             Logging configuration dictionary.
         """
         return self._config.get("logging", {})
+
+    def get_chat_service_config(self) -> dict[str, Any]:
+        """Get chat service configuration from YAML.
+
+        Returns:
+            Chat service configuration dictionary.
+        """
+        return self._config.get("chat", {}).get("service", {})

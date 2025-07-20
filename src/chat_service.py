@@ -2,9 +2,9 @@
 Chat Service for MCP Platform
 
 This module handles the business logic for chat sessions, including:
-- Conversation management
+- Conversation management with simple default prompts
 - Tool orchestration
-- MCP client coordination
+- MCP client coordination  
 - LLM interactions
 """
 
@@ -13,7 +13,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, Optional
+from collections.abc import AsyncGenerator
+from typing import TYPE_CHECKING, Any
 
 import mcp.types as types
 from mcp import McpError
@@ -21,7 +22,6 @@ from mcp import McpError
 if TYPE_CHECKING:
     from src.main import LLMClient, MCPClient
 
-from src.prompt_manager import PromptManager
 from src.tool_schema_manager import ToolSchemaManager
 
 logger = logging.getLogger(__name__)
@@ -31,7 +31,7 @@ class ChatMessage:
     """Represents a chat message with metadata."""
 
     def __init__(
-        self, message_type: str, content: Any, metadata: Dict[str, Any] = None
+        self, message_type: str, content: Any, metadata: dict[str, Any] | None = None
     ):
         self.type = message_type
         self.content = content
@@ -43,25 +43,31 @@ class ChatService:
     Main chat service that handles conversation logic and MCP coordination.
 
     This service is responsible for:
-    - Managing conversation state
+    - Managing conversation state with a built-in default system prompt
     - Coordinating between MCP clients and LLM
     - Executing tools and processing results
-    - Building system messages
     """
 
     def __init__(
         self,
-        clients: list["MCPClient"],
-        llm_client: "LLMClient",
+        clients: list[MCPClient],
+        llm_client: LLMClient,
         config: dict[str, Any],
     ):
         self.clients = clients
         self.llm_client = llm_client
         self.config = config
+        
+        # Extract chat service specific config
+        self.chat_config = config.get("chat", {}).get("service", {})
+        
         self.tool_schema_manager = ToolSchemaManager(clients)
-        self.prompt_manager = PromptManager(clients, self.tool_schema_manager)
         self._initialized = False
 
+    def _build_system_prompt(self) -> str:
+        """Build the system prompt using configuration."""
+        return self.chat_config["system_prompt"]
+ 
     async def initialize(self) -> None:
         """Initialize the chat service and all MCP clients."""
         if self._initialized:
@@ -87,7 +93,7 @@ class ChatService:
 
         self._initialized = True
 
-    async def _connect_with_health_check(self, client: "MCPClient") -> None:
+    async def _connect_with_health_check(self, client: MCPClient) -> None:
         """Connect a client and perform health check."""
         try:
             await client.connect()
@@ -119,22 +125,18 @@ class ChatService:
         Process a user message and yield response chunks.
 
         This method handles the complete conversation flow:
-        1. Start with default system prompt
+        1. Use default system prompt
         2. Get LLM response
-        3. If tool is called:
-           - Execute tool
-           - Switch to tool-specific prompt if available
-           - Get final response
-        4. Next message starts fresh with default prompt
+        3. If tool is called, execute tool and get final response
         """
         if not self._initialized:
             raise RuntimeError("Chat service not initialized")
 
-        # Start with default system prompt
+        # Use default system prompt
         messages = [
             {
                 "role": "system",
-                "content": await self.prompt_manager.get_system_message(),
+                "content": self._build_system_prompt(),
             }
         ]
         messages.extend(conversation_history)
@@ -194,17 +196,42 @@ class ChatService:
             tool_name = tool_call["function"]["name"]
             tool_args = json.loads(tool_call["function"]["arguments"])
 
-            # Yield tool execution notification
-            logger.info(f"Yielding tool execution message for tool: {tool_name}")
-            yield ChatMessage(
-                "tool_execution",
-                f"🔧 Executing tool: {tool_name}",
-                {"tool_name": tool_name, "tool_args": tool_args},
-            )
+            # Check if tool notifications are enabled
+            tool_notifications = self.chat_config["tool_notifications"]
+            if tool_notifications["enabled"]:
+                # Get configurable notification format
+                icon = tool_notifications["icon"]
+                format_template = tool_notifications["format"]
+                
+                notification_text = format_template.format(
+                    icon=icon,
+                    tool_name=tool_name,
+                    tool_args=(
+                        tool_args if tool_notifications["show_args"] else ""
+                    )
+                )
+                
+                # Yield tool execution notification
+                if self.chat_config["logging"]["tool_execution"]:
+                    logger.info(
+                        f"Yielding tool execution message for tool: {tool_name}"
+                    )
+                
+                yield ChatMessage(
+                    "tool_execution",
+                    notification_text,
+                    {"tool_name": tool_name, "tool_args": tool_args},
+                )
 
             # Execute the tool
             tool_result = await self._execute_tool_call(tool_name, tool_args)
-            logger.info(f"Tool result for {tool_name}: {tool_result[:200]}...")
+            
+            # Log tool result if logging is enabled
+            if self.chat_config["logging"]["tool_execution"]:
+                truncate_length = self.chat_config["logging"]["result_truncate_length"]
+                logger.info(
+                    f"Tool result for {tool_name}: {tool_result[:truncate_length]}..."
+                )
 
             # Add tool result to message history
             messages.append(
@@ -215,14 +242,7 @@ class ChatService:
                 }
             )
 
-        # After all tools are executed, check if first tool has a specific prompt
-        first_tool = tool_calls[0]["function"]["name"]
-        tool_prompt = await self.prompt_manager.get_system_message(first_tool)
-
-        # Update system message if tool has specific prompt
-        messages[0] = {"role": "system", "content": tool_prompt}
-
-        # Get final response from LLM with updated prompt
+        # Get final response from LLM (keeping the same system prompt)
         try:
             tools = self.tool_schema_manager.get_openai_tools()
             final_response = await self.llm_client.get_response_with_tools(
@@ -251,11 +271,22 @@ class ChatService:
     ) -> str:
         """Execute a tool call and return the result."""
         try:
-            logger.info(f"Executing tool '{tool_name}' with args: {tool_args}")
+            if self.chat_config["logging"]["tool_execution"]:
+                logger.info(f"Executing tool '{tool_name}' with args: {tool_args}")
+            
             result = await self.tool_schema_manager.call_tool(tool_name, tool_args)
-            logger.info(f"Raw tool result: {result}")
+            
+            if self.chat_config["logging"]["tool_execution"]:
+                logger.info(f"Raw tool result: {result}")
+            
             extracted_content = self._extract_content_from_result(result)
-            logger.info(f"Extracted content: {extracted_content[:200]}...")
+            
+            if self.chat_config["logging"]["tool_execution"]:
+                truncate_length = self.chat_config["logging"]["result_truncate_length"]
+                logger.info(
+                    f"Extracted content: {extracted_content[:truncate_length]}..."
+                )
+            
             return extracted_content
         except McpError as e:
             error_msg = f"MCP error executing tool '{tool_name}': {e.error.message}"
@@ -266,27 +297,9 @@ class ChatService:
             logger.error(error_msg)
             return error_msg
 
-    async def _get_system_message(self) -> str:
-        """Get system message from prompt manager."""
-        return await self.prompt_manager.get_system_message()
-
-    def _get_active_tool_from_history(
-        self, conversation_history: list[dict[str, Any]]
-    ) -> Optional[str]:
-        """
-        Determine the active tool from conversation history.
-
-        This looks at the most recent assistant message with tool calls
-        to determine which tool is currently being used.
-        """
-        # Look through history in reverse to find most recent tool usage
-        for message in reversed(conversation_history):
-            if message.get("role") == "assistant" and message.get("tool_calls"):
-                # Get the tool name from the first tool call
-                tool_calls = message["tool_calls"]
-                if tool_calls and len(tool_calls) > 0:
-                    return tool_calls[0]["function"]["name"]
-        return None
+    def _get_system_message(self) -> str:
+        """Get system message directly."""
+        return self._build_system_prompt()
 
     def _extract_content_from_result(self, result: types.CallToolResult) -> str:
         """Extract text content from a tool call result."""
@@ -295,30 +308,22 @@ class ChatService:
 
         content_parts = []
         for content_item in result.content:
-            if hasattr(content_item, "text"):
+            # Check the actual type and extract accordingly
+            if isinstance(content_item, types.TextContent):
                 content_parts.append(content_item.text)
-            elif hasattr(content_item, "data"):
-                # Handle binary data
-                content_parts.append(f"[Binary data: {len(content_item.data)} bytes]")
+            elif isinstance(content_item, types.ImageContent):
+                content_parts.append(f"[Image: {content_item.mimeType}]")
+            elif isinstance(content_item, types.AudioContent):
+                content_parts.append(f"[Audio: {content_item.mimeType}]")
             else:
-                content_parts.append(str(content_item))
+                # Handle other content types safely
+                data = getattr(content_item, "data", None)
+                if data is not None:
+                    try:
+                        content_parts.append(f"[Binary data: {len(data)} bytes]")
+                    except (TypeError, AttributeError):
+                        content_parts.append(f"[{type(content_item).__name__}]")
+                else:
+                    content_parts.append(str(content_item))
 
         return "\n".join(content_parts) if content_parts else "No readable content"
-
-    def _extract_content_from_prompt_message(
-        self, content: types.PromptMessage | types.TextContent | types.ImageContent
-    ) -> str:
-        """Extract text content from a prompt message."""
-        if hasattr(content, "text"):
-            return content.text
-        elif hasattr(content, "content"):
-            # Handle nested content structures
-            if isinstance(content.content, list):
-                text_parts = []
-                for item in content.content:
-                    if hasattr(item, "text"):
-                        text_parts.append(item.text)
-                return "\n".join(text_parts)
-            elif hasattr(content.content, "text"):
-                return content.content.text
-        return str(content)

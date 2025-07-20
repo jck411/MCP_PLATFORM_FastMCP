@@ -12,6 +12,7 @@ import httpx
 import mcp.types as types
 from mcp import ClientSession, McpError, StdioServerParameters
 from mcp.client.stdio import stdio_client
+
 from src.config import Configuration
 
 # Configure logging
@@ -37,54 +38,66 @@ class MCPClient:
         # Set our application's version identifier for MCP server identification
         self.client_version = "0.1.0"
 
+    def _resolve_command(self) -> str | None:
+        """Resolve command to executable path with generic handling."""
+        command = self.config.get("command")
+        if not command:
+            return None
+            
+        # Handle absolute paths
+        if os.path.isabs(command):
+            return command if os.path.exists(command) else None
+            
+        # Handle package managers generically
+        resolved = shutil.which(command)
+        
+        # Special handling for npx on Windows
+        if not resolved and command == "npx" and sys.platform == "win32":
+            # Try to find node and use it as fallback
+            node_path = shutil.which("node")
+            if node_path:
+                logging.warning("Using node instead of npx on Windows")
+                return node_path
+                
+        return resolved
+
     async def connect(self) -> None:
         """Connect to MCP server using official transport patterns."""
         while self._reconnect_attempts < self._max_reconnect_attempts:
             try:
                 await self._attempt_connection()
-                self._reconnect_attempts = 0  # Reset on successful connection
                 self._is_connected = True
+                self._reconnect_attempts = 0  # Reset on success
                 return
             except Exception as e:
                 self._reconnect_attempts += 1
+                self._is_connected = False
+                
                 if self._reconnect_attempts >= self._max_reconnect_attempts:
                     logging.error(
-                        f"Failed to connect MCP client {self.name} after "
+                        f"Failed to connect to {self.name} after "
                         f"{self._max_reconnect_attempts} attempts: {e}"
                     )
                     raise
-
-                # Exponential backoff with jitter
-                delay = min(
-                    self._reconnect_delay * (2**self._reconnect_attempts), 60.0
-                )
+                
                 logging.warning(
                     f"Connection attempt {self._reconnect_attempts} failed for "
-                    f"{self.name}, retrying in {delay:.1f}s: {e}"
+                    f"{self.name}: {e}. Retrying in {self._reconnect_delay}s..."
                 )
-                await asyncio.sleep(delay)
+                await asyncio.sleep(self._reconnect_delay)
+                self._reconnect_delay = min(
+                    self._reconnect_delay * 2, 30.0
+                )  # Exponential backoff
 
     async def _attempt_connection(self) -> None:
         """Attempt a single connection to the MCP server."""
-        # Validate and resolve command with Windows npx handling
-        command = self.config.get("command")
-        if command == "npx":
-            if sys.platform == "win32":
-                # On Windows, npx can leak stdio pipes. Warn and use node directly.
-                logging.warning(
-                    "Using npx on Windows may leak stdio pipes. "
-                    "Consider using node directly."
-                )
-                node_path = shutil.which("node")
-                # Try to use node directly if available, otherwise use npx
-                command = node_path or shutil.which("npx")
-            else:
-                command = shutil.which("npx")
-        else:
-            command = shutil.which(command) if command else None
+        # Use the improved command resolution
+        command = self._resolve_command()
 
         if not command:
-            raise ValueError("The command must be a valid string and cannot be None.")
+            raise ValueError(
+                f"Command '{self.config.get('command')}' not found in PATH"
+            )
 
         # Create server parameters following official patterns
         server_params = StdioServerParameters(
@@ -109,23 +122,8 @@ class MCPClient:
             ClientSession(read_stream, write_stream, client_info=client_info)
         )
 
-        # Initialize session with explicit protocol version and timeout
-        try:
-            # Try to use InitializationOptions for SDK 1.12+ compatibility
-            init_options = types.InitializationOptions(
-                protocolVersion=types.LATEST_PROTOCOL_VERSION
-            )
-            await asyncio.wait_for(self.session.initialize(init_options), timeout=30.0)
-        except (TypeError, AttributeError):
-            # Fallback for older SDK versions
-            await asyncio.wait_for(self.session.initialize(), timeout=30.0)
-
-        # Send initial ping to verify connection
-        try:
-            await self.session.ping()
-        except AttributeError:
-            # Fallback for older SDK versions
-            await self.session.send_ping()
+        # Simplified initialization - no fallback needed
+        await asyncio.wait_for(self.session.initialize(), timeout=30.0)
 
         logging.info(f"MCP client '{self.name}' connected successfully")
 
@@ -135,11 +133,8 @@ class MCPClient:
             return False
 
         try:
-            try:
-                await self.session.ping()
-            except AttributeError:
-                # Fallback for older SDK versions
-                await self.session.send_ping()
+            # Check if session is responsive with a simple operation
+            await self.session.list_tools()
             return True
         except Exception as e:
             logging.warning(f"Ping failed for {self.name}: {e}")
@@ -151,7 +146,7 @@ class MCPClient:
         if not self.session:
             raise McpError(
                 error=types.ErrorData(
-                    code=types.ErrorCode.INTERNAL_ERROR,
+                    code=types.INTERNAL_ERROR,
                     message=f"Client {self.name} not connected",
                 )
             )
@@ -170,7 +165,7 @@ class MCPClient:
             logging.error(f"Error listing tools from {self.name}: {e}")
             raise McpError(
                 error=types.ErrorData(
-                    code=types.ErrorCode.INTERNAL_ERROR,
+                    code=types.INTERNAL_ERROR,
                     message=f"Failed to list tools: {str(e)}",
                 )
             ) from e
@@ -180,7 +175,7 @@ class MCPClient:
         if not self.session:
             raise McpError(
                 error=types.ErrorData(
-                    code=types.ErrorCode.INTERNAL_ERROR,
+                    code=types.INTERNAL_ERROR,
                     message=f"Client {self.name} not connected",
                 )
             )
@@ -199,10 +194,10 @@ class MCPClient:
             logging.error(f"Error listing prompts from {self.name}: {e}")
             raise McpError(
                 error=types.ErrorData(
-                    code=types.ErrorCode.INTERNAL_ERROR,
+                    code=types.INTERNAL_ERROR,
                     message=f"Failed to list prompts: {str(e)}",
                 )
-            )
+            ) from e
 
     async def get_prompt(
         self, name: str, arguments: dict[str, Any] | None = None
@@ -211,7 +206,7 @@ class MCPClient:
         if not self.session:
             raise McpError(
                 error=types.ErrorData(
-                    code=types.ErrorCode.INTERNAL_ERROR,
+                    code=types.INTERNAL_ERROR,
                     message=f"Client {self.name} not connected",
                 )
             )
@@ -229,10 +224,71 @@ class MCPClient:
             logging.error(f"Error getting prompt '{name}' from {self.name}: {e}")
             raise McpError(
                 error=types.ErrorData(
-                    code=types.ErrorCode.INTERNAL_ERROR,
+                    code=types.INTERNAL_ERROR,
                     message=f"Failed to get prompt '{name}': {str(e)}",
                 )
+            ) from e
+
+    async def list_resources(self) -> list[types.Resource]:
+        """List available resources using official SDK patterns."""
+        if not self.session:
+            raise McpError(
+                error=types.ErrorData(
+                    code=types.INTERNAL_ERROR,
+                    message=f"Client {self.name} not connected",
+                )
             )
+
+        try:
+            result = await self.session.list_resources()
+            return result.resources
+        except McpError as e:
+            # Re-raise MCP errors with proper error data
+            logging.error(
+                f"MCP error listing resources from {self.name}: {e.error.message}"
+            )
+            raise
+        except Exception as e:
+            # Convert other exceptions to MCP errors
+            logging.error(f"Error listing resources from {self.name}: {e}")
+            raise McpError(
+                error=types.ErrorData(
+                    code=types.INTERNAL_ERROR,
+                    message=f"Failed to list resources: {str(e)}",
+                )
+            ) from e
+
+    async def read_resource(self, uri: str) -> types.ReadResourceResult:
+        """Read a resource by URI using official SDK patterns."""
+        if not self.session:
+            raise McpError(
+                error=types.ErrorData(
+                    code=types.INTERNAL_ERROR,
+                    message=f"Client {self.name} not connected",
+                )
+            )
+
+        try:
+            from pydantic import AnyUrl
+            # Convert string URI to AnyUrl for MCP SDK compatibility
+            resource_uri = AnyUrl(uri)
+            return await self.session.read_resource(resource_uri)
+        except McpError as e:
+            # Re-raise MCP errors with proper error data
+            logging.error(
+                f"MCP error reading resource '{uri}' from {self.name}: "
+                f"{e.error.message}"
+            )
+            raise
+        except Exception as e:
+            # Convert other exceptions to MCP errors
+            logging.error(f"Error reading resource '{uri}' from {self.name}: {e}")
+            raise McpError(
+                error=types.ErrorData(
+                    code=types.INTERNAL_ERROR,
+                    message=f"Failed to read resource '{uri}': {str(e)}",
+                )
+            ) from e
 
     async def call_tool(
         self, name: str, arguments: dict[str, Any] | None = None
@@ -241,7 +297,7 @@ class MCPClient:
         if not self.session:
             raise McpError(
                 error=types.ErrorData(
-                    code=types.ErrorCode.INTERNAL_ERROR,
+                    code=types.INTERNAL_ERROR,
                     message=f"Client {self.name} not connected",
                 )
             )
@@ -262,17 +318,17 @@ class MCPClient:
             logging.error(f"Error calling tool '{name}': {e}")
             raise McpError(
                 error=types.ErrorData(
-                    code=types.ErrorCode.INTERNAL_ERROR,
+                    code=types.INTERNAL_ERROR,
                     message=f"Tool call failed: {str(e)}",
                 )
-            )
+            ) from e
 
     async def get_tool_schemas(self) -> list[str]:
         """Get tool schemas as JSON strings using SDK's native methods."""
         if not self.session:
             raise McpError(
                 error=types.ErrorData(
-                    code=types.ErrorCode.INTERNAL_ERROR,
+                    code=types.INTERNAL_ERROR,
                     message=f"Client {self.name} not connected",
                 )
             )
@@ -346,25 +402,25 @@ class LLMClient:
             logging.error(f"HTTP error: {e}")
             raise McpError(
                 error=types.ErrorData(
-                    code=types.ErrorCode.INTERNAL_ERROR, message=f"HTTP error: {str(e)}"
+                    code=types.INTERNAL_ERROR, message=f"HTTP error: {str(e)}"
                 )
-            )
+            ) from e
         except KeyError as e:
             logging.error(f"Unexpected response format: {e}")
             raise McpError(
                 error=types.ErrorData(
-                    code=types.ErrorCode.PARSE_ERROR,
+                    code=types.PARSE_ERROR,
                     message=f"Unexpected response format: {str(e)}",
                 )
-            )
+            ) from e
         except Exception as e:
             logging.error(f"LLM API error: {e}")
             raise McpError(
                 error=types.ErrorData(
-                    code=types.ErrorCode.INTERNAL_ERROR,
+                    code=types.INTERNAL_ERROR,
                     message=f"LLM API error: {str(e)}",
                 )
-            )
+            ) from e
 
     async def close(self) -> None:
         """Close the HTTP client."""

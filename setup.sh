@@ -15,7 +15,8 @@ fi
 # Check if .env exists
 if [ ! -f .env ]; then
     echo "⚠️  .env file not found. Please create one with your API keys:"
-    echo "   echo 'LLM_API_KEY=your_key_here' > .env"
+    echo "   echo 'GROQ_API_KEY=your_groq_key_here' > .env"
+    echo "   # OR use OPENAI_API_KEY, ANTHROPIC_API_KEY, etc."
     echo "   Continuing with setup..."
 fi
 
@@ -30,4 +31,10 @@ echo "✅ Setup complete!"
 echo ""
 echo "Next steps:"
 echo "1. Edit .env with your API keys"
-echo "2. Run: ./run.sh"
+echo "2. Add your FastMCP servers to src/servers_config.json"
+echo "3. Run: ./run.sh"
+echo ""
+echo "Available commands:"
+echo "  ./run.sh              # Start the MCP platform"
+echo "  uv run python src/main.py  # Direct execution"
+echo "  uv run mcp-platform   # Using entry point"
