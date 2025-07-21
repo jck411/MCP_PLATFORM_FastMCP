@@ -22,7 +22,7 @@ chat:
     # System prompt configuration
     system_prompt: |
       You are a helpful assistant with a sense of humor.
-      You have access to tools.
+      You have access to to a list of tools.
       Choose the appropriate tool for tasks.
 
     # Tool execution notifications

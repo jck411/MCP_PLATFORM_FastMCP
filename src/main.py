@@ -43,14 +43,13 @@ class MCPClient:
         command = self.config.get("command")
         if not command:
             return None
-            
         # Handle absolute paths
         if os.path.isabs(command):
             return command if os.path.exists(command) else None
-            
+
         # Handle package managers generically
         resolved = shutil.which(command)
-        
+
         # Special handling for npx on Windows
         if not resolved and command == "npx" and sys.platform == "win32":
             # Try to find node and use it as fallback
@@ -58,7 +57,7 @@ class MCPClient:
             if node_path:
                 logging.warning("Using node instead of npx on Windows")
                 return node_path
-                
+
         return resolved
 
     async def connect(self) -> None:
@@ -72,14 +71,14 @@ class MCPClient:
             except Exception as e:
                 self._reconnect_attempts += 1
                 self._is_connected = False
-                
+
                 if self._reconnect_attempts >= self._max_reconnect_attempts:
                     logging.error(
                         f"Failed to connect to {self.name} after "
                         f"{self._max_reconnect_attempts} attempts: {e}"
                     )
                     raise
-                
+
                 logging.warning(
                     f"Connection attempt {self._reconnect_attempts} failed for "
                     f"{self.name}: {e}. Retrying in {self._reconnect_delay}s..."

@@ -15,53 +15,23 @@ from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("Demo")
 
 
-@mcp.resource("dir://desktop")
-def desktop() -> list[str]:
-    """List the files in the user's desktop"""
+@mcp.resource(
+    "resource://desktop-files",
+    name="DesktopListing",
+    description="List of files under ~/Documents/MCP.resources",
+    mime_type="text/plain",
+)
+def desktop() -> str:
+    """List the files in the MCP resources directory"""
     desktop = Path("/home/jack/Documents/MCP.resources")
-    return [str(f) for f in desktop.iterdir()]
+    files = [f.name for f in desktop.iterdir() if f.is_file()]
+    return "\n".join(f"- {file}" for file in sorted(files))
 
 
 @mcp.tool()
 def sum(a: int, b: int) -> int:
     """Add two numbers"""
     return a + b
-
-
-@mcp.tool()
-def list_resources() -> str:
-    """List all available resources and their descriptions"""
-    desktop = Path("/home/jack/Documents/MCP.resources")
-    files = [str(f) for f in desktop.iterdir()]
-    return f"Available resource files: {', '.join(files)}"
-
-
-@mcp.tool()
-def read_file(filename: str) -> str:
-    """Read the contents of a file from the MCP resources directory"""
-    desktop = Path("/home/jack/Documents/MCP.resources")
-    file_path = desktop / filename
-    if file_path.exists():
-        return file_path.read_text()
-    return f"File {filename} not found in resources directory"
-
-
-@mcp.prompt()
-def analyze_file(filename: str) -> str:
-    """Analyze a file from the MCP resources directory"""
-    return (
-        f"Please analyze the file '{filename}' for key insights "
-        f"and summarize its content."
-    )
-
-
-@mcp.prompt()
-def explain_code(code: str, language: str = "python") -> str:
-    """Explain how a piece of code works"""
-    return (
-        f"Please explain how this {language} code works:\n\n"
-        f"```{language}\n{code}\n```"
-    )
 
 
 @mcp.prompt()
