@@ -1,3 +1,7 @@
+"""
+Main module for MCP client implementation.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -15,7 +19,6 @@ from mcp.client.stdio import stdio_client
 
 from src.config import Configuration
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
@@ -34,8 +37,6 @@ class MCPClient:
         self._max_reconnect_attempts: int = 5
         self._reconnect_delay: float = 1.0
         self._is_connected: bool = False
-
-        # Set our application's version identifier for MCP server identification
         self.client_version = "0.1.0"
 
     def _resolve_command(self) -> str | None:
@@ -43,16 +44,13 @@ class MCPClient:
         command = self.config.get("command")
         if not command:
             return None
-        # Handle absolute paths
+
         if os.path.isabs(command):
             return command if os.path.exists(command) else None
 
-        # Handle package managers generically
         resolved = shutil.which(command)
 
-        # Special handling for npx on Windows
         if not resolved and command == "npx" and sys.platform == "win32":
-            # Try to find node and use it as fallback
             node_path = shutil.which("node")
             if node_path:
                 logging.warning("Using node instead of npx on Windows")
@@ -66,7 +64,7 @@ class MCPClient:
             try:
                 await self._attempt_connection()
                 self._is_connected = True
-                self._reconnect_attempts = 0  # Reset on success
+                self._reconnect_attempts = 0
                 return
             except Exception as e:
                 self._reconnect_attempts += 1
@@ -84,13 +82,10 @@ class MCPClient:
                     f"{self.name}: {e}. Retrying in {self._reconnect_delay}s..."
                 )
                 await asyncio.sleep(self._reconnect_delay)
-                self._reconnect_delay = min(
-                    self._reconnect_delay * 2, 30.0
-                )  # Exponential backoff
+                self._reconnect_delay = min(self._reconnect_delay * 2, 30.0)
 
     async def _attempt_connection(self) -> None:
         """Attempt a single connection to the MCP server."""
-        # Use the improved command resolution
         command = self._resolve_command()
 
         if not command:
@@ -98,7 +93,6 @@ class MCPClient:
                 f"Command '{self.config.get('command')}' not found in PATH"
             )
 
-        # Create server parameters following official patterns
         server_params = StdioServerParameters(
             command=command,
             args=self.config.get("args", []),
@@ -107,21 +101,17 @@ class MCPClient:
             else None,
         )
 
-        # Use official stdio_client helper
         stdio_transport = await self.exit_stack.enter_async_context(
             stdio_client(server_params)
         )
         read_stream, write_stream = stdio_transport
 
-        # Create client info for session with dynamic version
         client_info = types.Implementation(name=self.name, version=self.client_version)
 
-        # Create session with proper transport handling
         self.session = await self.exit_stack.enter_async_context(
             ClientSession(read_stream, write_stream, client_info=client_info)
         )
 
-        # Simplified initialization - no fallback needed
         await asyncio.wait_for(self.session.initialize(), timeout=30.0)
 
         logging.info(f"MCP client '{self.name}' connected successfully")
@@ -132,7 +122,6 @@ class MCPClient:
             return False
 
         try:
-            # Check if session is responsive with a simple operation
             await self.session.list_tools()
             return True
         except Exception as e:
@@ -154,13 +143,11 @@ class MCPClient:
             result = await self.session.list_tools()
             return result.tools
         except McpError as e:
-            # Re-raise MCP errors with proper error data
             logging.error(
                 f"MCP error listing tools from {self.name}: {e.error.message}"
             )
             raise
         except Exception as e:
-            # Convert other exceptions to MCP errors
             logging.error(f"Error listing tools from {self.name}: {e}")
             raise McpError(
                 error=types.ErrorData(
@@ -183,13 +170,11 @@ class MCPClient:
             result = await self.session.list_prompts()
             return result.prompts
         except McpError as e:
-            # Re-raise MCP errors with proper error data
             logging.error(
                 f"MCP error listing prompts from {self.name}: {e.error.message}"
             )
             raise
         except Exception as e:
-            # Convert other exceptions to MCP errors
             logging.error(f"Error listing prompts from {self.name}: {e}")
             raise McpError(
                 error=types.ErrorData(
@@ -213,13 +198,11 @@ class MCPClient:
         try:
             return await self.session.get_prompt(name, arguments)
         except McpError as e:
-            # Re-raise MCP errors with proper error data
             logging.error(
                 f"MCP error getting prompt '{name}' from {self.name}: {e.error.message}"
             )
             raise
         except Exception as e:
-            # Convert other exceptions to MCP errors
             logging.error(f"Error getting prompt '{name}' from {self.name}: {e}")
             raise McpError(
                 error=types.ErrorData(
@@ -242,13 +225,11 @@ class MCPClient:
             result = await self.session.list_resources()
             return result.resources
         except McpError as e:
-            # Re-raise MCP errors with proper error data
             logging.error(
                 f"MCP error listing resources from {self.name}: {e.error.message}"
             )
             raise
         except Exception as e:
-            # Convert other exceptions to MCP errors
             logging.error(f"Error listing resources from {self.name}: {e}")
             raise McpError(
                 error=types.ErrorData(
@@ -269,18 +250,15 @@ class MCPClient:
 
         try:
             from pydantic import AnyUrl
-            # Convert string URI to AnyUrl for MCP SDK compatibility
             resource_uri = AnyUrl(uri)
             return await self.session.read_resource(resource_uri)
         except McpError as e:
-            # Re-raise MCP errors with proper error data
             logging.error(
                 f"MCP error reading resource '{uri}' from {self.name}: "
                 f"{e.error.message}"
             )
             raise
         except Exception as e:
-            # Convert other exceptions to MCP errors
             logging.error(f"Error reading resource '{uri}' from {self.name}: {e}")
             raise McpError(
                 error=types.ErrorData(
@@ -302,18 +280,15 @@ class MCPClient:
             )
 
         try:
-            # Log tool execution without exposing sensitive arguments
             logging.info(f"Calling tool '{name}' on client '{self.name}'")
 
             result = await self.session.call_tool(name, arguments)
             logging.info(f"Tool '{name}' executed successfully")
             return result
         except McpError as e:
-            # Re-raise MCP errors with proper error data
             logging.error(f"MCP error calling tool '{name}': {e.error.message}")
             raise
         except Exception as e:
-            # Convert other exceptions to MCP errors
             logging.error(f"Error calling tool '{name}': {e}")
             raise McpError(
                 error=types.ErrorData(
@@ -334,7 +309,6 @@ class MCPClient:
 
         try:
             tools = await self.list_tools()
-            # Use model_dump_json() to get JSON strings as expected by consumers
             return [tool.model_dump_json() for tool in tools]
         except Exception as e:
             logging.error(f"Error getting tool schemas from {self.name}: {e}")
@@ -389,8 +363,6 @@ class LLMClient:
             response.raise_for_status()
             result = response.json()
 
-            # Return the complete choice object to preserve tool_calls and other
-            # metadata
             choice = result["choices"][0]
             return {
                 "message": choice["message"],
@@ -438,22 +410,17 @@ async def main() -> None:
     """Main entry point - WebSocket interface only."""
     config = Configuration()
 
-    # Load server configurations
     config_path = os.path.join(os.path.dirname(__file__), "servers_config.json")
     servers_config = config.load_config(config_path)
 
-    # Create MCP clients
     clients = []
     for name, server_config in servers_config["mcpServers"].items():
         clients.append(MCPClient(name, server_config))
 
-    # Create LLM client
     llm_config = config.get_llm_config()
     api_key = config.llm_api_key
 
-    # Use async context manager to ensure proper cleanup
     async with LLMClient(llm_config, api_key) as llm_client:
-        # Start WebSocket server
         from src.websocket_server import run_websocket_server
 
         await run_websocket_server(clients, llm_client, config.get_config_dict())

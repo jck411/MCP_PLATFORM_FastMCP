@@ -28,19 +28,6 @@ def desktop() -> str:
     return "\n".join(f"- {file}" for file in sorted(files))
 
 
-@mcp.tool()
-def sum(a: int, b: int) -> int:
-    """Add two numbers"""
-    return a + b
-
-
-@mcp.prompt()
-def summarize_conversation() -> str:
-    """Create a summary of the current conversation"""
-    return (
-        "Please provide a concise summary of our conversation so far, "
-        "highlighting the main topics and any important conclusions."
-    )
 
 
 if __name__ == "__main__":

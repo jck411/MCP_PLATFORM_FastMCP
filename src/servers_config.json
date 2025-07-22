@@ -4,7 +4,34 @@
       "command": "uv",
       "args": ["run", "python", "Servers/demo_server.py"],
       "env": {},
-      "cwd": "/home/jack/MCP_PLATFORM_FastMCP"
+      "cwd": "/home/jack/MCP_PLATFORM_FastMCP",
+      "capabilities": {
+        "tools": true,
+        "prompts": true,
+        "resources": true,
+        "logging": true,
+        "completions": true
+      }
+    },
+    "template": {
+      "command": "uv",
+      "args": ["run", "python", "Servers/demo_resources_server.py"],
+      "env": {},
+      "cwd": "/home/jack/MCP_PLATFORM_FastMCP",
+      "capabilities": {
+        "tools": true,
+        "prompts": true,
+        "resources": true,
+        "logging": true,
+        "completions": true
+      }
     }
+  },
+  "settings": {
+    "defaultTimeout": 30,
+    "maxRetries": 3,
+    "retryDelay": 1.0,
+    "logLevel": "INFO",
+    "autoReconnect": true
   }
 }

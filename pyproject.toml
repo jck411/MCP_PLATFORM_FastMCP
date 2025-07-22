@@ -5,20 +5,23 @@ description = "Modern MCP Platform with comprehensive protocol support"
 authors = [
     {name = "Jack", email = "jack@example.com"}
 ]
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
-    "python-dotenv>=1.1.1",
+    "python-dotenv>=1.1.1",  # Latest stable
     "mcp>=1.12.0",
-    "openai>=1.95.1",
-    "PyYAML>=6.0.2",
-    "websockets>=15.0.1",
-    "fastapi>=0.116.0",
-    "uvicorn>=0.35.0",
-    "httpx>=0.28.0",
-    "anyio>=4.9.0",
-    "click>=8.2.0",
+    "openai>=1.12.0",
+    "PyYAML>=6.0.1",
+    "websockets>=12.0.0",
+    "fastapi>=0.109.0",
+    "uvicorn>=0.27.0",
+    "httpx>=0.26.0",
+    "anyio>=4.2.0",
+    "click>=8.1.7",
     "fastmcp>=2.10.6",
-    "pymupdf>=1.26.3",
+    "pymupdf>=1.23.8",
+    "pydantic>=2.5.3",
+    "starlette>=0.34.0",
+    "mcp-logger-utils>=0.2.1",
 ]
 
 [project.scripts]
@@ -26,16 +29,16 @@ mcp-platform = "src.main:main"
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.4.1",
-    "pytest-asyncio>=1.0.0",
-    "ruff>=0.12.3",
-    "mypy>=1.17.0",
-    "pyright>=1.1.403",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.2",
+    "ruff>=0.2.1",
+    "mypy>=1.8.0",
+    "pyright>=1.1.350",
 ]
 
 [tool.ruff]
 line-length = 88
-target-version = "py311"
+target-version = "py313"
 
 [tool.ruff.lint]
 select = [
@@ -47,6 +50,13 @@ select = [
     "B",   # flake8-bugbear
     "SIM", # flake8-simplify
     "C4",  # flake8-comprehensions
+    "T20", # flake8-print
+    "RET", # flake8-return
+    "SLF", # flake8-self
+    "ARG", # flake8-unused-arguments
+    "ERA", # eradicate commented out code
+    "PL",  # pylint
+    "RUF", # ruff-specific rules
 ]
 ignore = [
     "E203", # whitespace before ':' (conflicts with black)
@@ -55,24 +65,24 @@ ignore = [
 [tool.ruff.format]
 quote-style = "double"
 docstring-code-format = true
+line-ending = "lf"
 
-# No additional UV sources needed
-
-[dependency-groups]
-dev = [
-    "pre-commit>=4.2.0",
-    "ruff>=0.12.4",
-]
+[tool.mypy]
+python_version = "3.13"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+disallow_any_generics = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.21.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
-
-[tool.mypy]
-python_version = "3.11"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = true
