@@ -1,6 +1,7 @@
 {
   "mcpServers": {
     "demo": {
+      "enabled": true,
       "command": "uv",
       "args": ["run", "python", "Servers/demo_server.py"],
       "env": {},
@@ -14,6 +15,7 @@
       }
     },
     "template": {
+      "enabled": true,
       "command": "uv",
       "args": ["run", "python", "Servers/demo_resources_server.py"],
       "env": {},
@@ -22,6 +24,20 @@
         "tools": true,
         "prompts": true,
         "resources": true,
+        "logging": true,
+        "completions": true
+      }
+    },
+    "demo_prompt": {
+      "enabled": true,
+      "command": "uv",
+      "args": ["run", "python", "Servers/demo_prompt_server.py"],
+      "env": {},
+      "cwd": "/home/jack/MCP_PLATFORM_FastMCP",
+      "capabilities": {
+        "tools": false,
+        "prompts": true,
+        "resources": false,
         "logging": true,
         "completions": true
       }
