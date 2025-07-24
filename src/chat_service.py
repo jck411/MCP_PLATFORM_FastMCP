@@ -14,12 +14,14 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncGenerator
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
-import mcp.types as types
+from mcp import types
 
 if TYPE_CHECKING:
     from src.main import LLMClient, MCPClient
+    from src.tool_schema_manager import ToolSchemaManager
+else:
     from src.tool_schema_manager import ToolSchemaManager
 
 logger = logging.getLogger(__name__)
@@ -41,7 +43,7 @@ class ChatMessage:
 
 class ChatService:
     """
-    Conversation orchestrator – recommended pattern
+    Conversation orchestrator - recommended pattern
     1. Takes your message
     2. Figures out what tools might be needed
     3. Asks the AI to respond (and use tools if needed)
@@ -68,13 +70,31 @@ class ChatService:
             if self._ready.is_set():
                 return
 
-            await asyncio.gather(
+            # Connect to all clients and collect results
+            connection_results = await asyncio.gather(
                 *(c.connect() for c in self.clients), return_exceptions=True
             )
 
-            from src.tool_schema_manager import ToolSchemaManager
+            # Filter out only successfully connected clients
+            connected_clients = []
+            for i, result in enumerate(connection_results):
+                if isinstance(result, Exception):
+                    logger.warning(
+                        f"Client '{self.clients[i].name}' failed to connect: {result}"
+                    )
+                else:
+                    connected_clients.append(self.clients[i])
 
-            self.tool_mgr = ToolSchemaManager(self.clients)
+            if not connected_clients:
+                raise RuntimeError("No MCP clients successfully connected")
+
+            logger.info(
+                f"Successfully connected to {len(connected_clients)} out of "
+                f"{len(self.clients)} MCP clients"
+            )
+
+            # Use only connected clients for tool management
+            self.tool_mgr = ToolSchemaManager(connected_clients)
             await self.tool_mgr.initialize()
 
             self._resource_catalog = sorted(
@@ -98,7 +118,7 @@ class ChatService:
         self,
         user_msg: str,
         history: list[dict[str, Any]],
-    ) -> AsyncGenerator[ChatMessage, None]:
+    ) -> AsyncGenerator[ChatMessage]:
         """Process a user message and yield response chunks."""
         await self._ready.wait()
 
@@ -138,7 +158,7 @@ class ChatService:
 
                 # Handle structured content
                 content = self._pluck_content(result)
-                
+
                 conv.append(
                     {
                         "role": "tool",
@@ -233,6 +253,25 @@ class ChatService:
             )
 
         return base
+
+    async def cleanup(self) -> None:
+        """Clean up resources by closing all connected MCP clients."""
+        # Only cleanup clients that are actually connected
+        if hasattr(self, 'tool_mgr') and self.tool_mgr:
+            # Get connected clients from tool manager
+            for client in self.tool_mgr.clients:
+                try:
+                    await client.close()
+                except Exception as e:
+                    logger.warning(f"Error closing client {client.name}: {e}")
+        else:
+            # Fallback: try to close all clients if tool_mgr isn't available
+            for client in self.clients:
+                try:
+                    if client.is_connected:
+                        await client.close()
+                except Exception as e:
+                    logger.warning(f"Error closing client {client.name}: {e}")
 
     async def apply_prompt(self, name: str, args: dict[str, str]) -> list[dict]:
         """Apply a parameterized prompt and return conversation messages."""

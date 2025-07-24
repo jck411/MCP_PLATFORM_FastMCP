@@ -10,9 +10,9 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-import mcp.types as types
-from mcp import McpError
-from pydantic import BaseModel, ValidationError, create_model
+from mcp import McpError, types
+from pydantic import BaseModel, Field, ValidationError, create_model
+from pydantic.json_schema import JsonSchemaValue
 
 if TYPE_CHECKING:
     from src.main import MCPClient
@@ -55,6 +55,13 @@ class ToolSchemaManager:
 
     async def _register_client_tools(self, client: MCPClient) -> None:
         """Register tools from a specific MCP client."""
+        # Skip clients that are not connected
+        if not client.is_connected:
+            logger.warning(
+                f"Skipping tool registration for disconnected client '{client.name}'"
+            )
+            return
+
         try:
             tools = await client.list_tools()
             for tool in tools:
@@ -65,7 +72,7 @@ class ToolSchemaManager:
 
                 openai_schema = self._convert_to_openai_schema(tool)
                 validation_model = self._create_validation_model(tool)
-                
+
                 if validation_model:
                     self._schema_cache[tool_name] = validation_model
 
@@ -80,38 +87,63 @@ class ToolSchemaManager:
 
     async def _register_client_prompts(self, client: MCPClient) -> None:
         """Register prompts from a specific MCP client."""
+        # Skip clients that are not connected
+        if not client.is_connected:
+            logger.warning(
+                f"Skipping prompt registration for disconnected client '{client.name}'"
+            )
+            return
+
         try:
             prompts = await client.list_prompts()
             for prompt in prompts:
                 prompt_name = prompt.name
                 if prompt_name in self._prompt_registry:
-                    logger.warning(f"Prompt name conflict: '{prompt_name}' already exists")
+                    logger.warning(
+                        f"Prompt name conflict: '{prompt_name}' already exists"
+                    )
                     prompt_name = f"{client.name}_{prompt_name}"
 
                 prompt_info = PromptInfo(prompt, client)
                 self._prompt_registry[prompt_name] = prompt_info
 
-            logger.info(f"Registered {len(prompts)} prompts from client '{client.name}'")
+            logger.info(
+                f"Registered {len(prompts)} prompts from client '{client.name}'"
+            )
         except Exception as e:
             logger.error(f"Error registering prompts from client '{client.name}': {e}")
             raise
 
     async def _register_client_resources(self, client: MCPClient) -> None:
         """Register resources from a specific MCP client."""
+        # Skip clients that are not connected
+        if not client.is_connected:
+            logger.warning(
+                f"Skipping resource registration for disconnected "
+                f"client '{client.name}'"
+            )
+            return
+
         try:
             resources = await client.list_resources()
             for resource in resources:
                 resource_uri = str(resource.uri)
                 if resource_uri in self._resource_registry:
-                    logger.warning(f"Resource URI conflict: '{resource_uri}' already exists")
+                    logger.warning(
+                        f"Resource URI conflict: '{resource_uri}' already exists"
+                    )
                     resource_uri = f"{client.name}::{resource_uri}"
 
                 resource_info = ResourceInfo(resource, client)
                 self._resource_registry[resource_uri] = resource_info
 
-            logger.info(f"Registered {len(resources)} resources from client '{client.name}'")
+            logger.info(
+                f"Registered {len(resources)} resources from client '{client.name}'"
+            )
         except Exception as e:
-            logger.error(f"Error registering resources from client '{client.name}': {e}")
+            logger.error(
+                f"Error registering resources from client '{client.name}': {e}"
+            )
             raise
 
     def _create_validation_model(self, tool: types.Tool) -> type[BaseModel] | None:
@@ -156,10 +188,10 @@ class ToolSchemaManager:
 
     def _schema_to_pydantic_fields(self, schema: dict[str, Any]) -> dict[str, Any]:
         """Convert JSON schema to Pydantic field definitions."""
-        from pydantic import Field
-        from pydantic.json_schema import JsonSchemaValue
 
-        def _process_schema(field_schema: JsonSchemaValue) -> tuple[type, dict[str, Any]]:
+        def _process_schema(
+            field_schema: JsonSchemaValue,
+        ) -> tuple[type, dict[str, Any]]:
             if "type" not in field_schema:
                 raise ValueError("Schema field must have a type")
 

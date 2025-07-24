@@ -13,11 +13,12 @@ from contextlib import AsyncExitStack
 from typing import Any
 
 import httpx
-import mcp.types as types
-from mcp import ClientSession, McpError, StdioServerParameters
+from mcp import ClientSession, McpError, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
+from pydantic import AnyUrl
 
 from src.config import Configuration
+from src.websocket_server import run_websocket_server
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -152,7 +153,7 @@ class MCPClient:
             raise McpError(
                 error=types.ErrorData(
                     code=types.INTERNAL_ERROR,
-                    message=f"Failed to list tools: {str(e)}",
+                    message=f"Failed to list tools: {e!s}",
                 )
             ) from e
 
@@ -179,7 +180,7 @@ class MCPClient:
             raise McpError(
                 error=types.ErrorData(
                     code=types.INTERNAL_ERROR,
-                    message=f"Failed to list prompts: {str(e)}",
+                    message=f"Failed to list prompts: {e!s}",
                 )
             ) from e
 
@@ -207,7 +208,7 @@ class MCPClient:
             raise McpError(
                 error=types.ErrorData(
                     code=types.INTERNAL_ERROR,
-                    message=f"Failed to get prompt '{name}': {str(e)}",
+                    message=f"Failed to get prompt '{name}': {e!s}",
                 )
             ) from e
 
@@ -234,7 +235,7 @@ class MCPClient:
             raise McpError(
                 error=types.ErrorData(
                     code=types.INTERNAL_ERROR,
-                    message=f"Failed to list resources: {str(e)}",
+                    message=f"Failed to list resources: {e!s}",
                 )
             ) from e
 
@@ -249,7 +250,6 @@ class MCPClient:
             )
 
         try:
-            from pydantic import AnyUrl
             resource_uri = AnyUrl(uri)
             return await self.session.read_resource(resource_uri)
         except McpError as e:
@@ -263,7 +263,7 @@ class MCPClient:
             raise McpError(
                 error=types.ErrorData(
                     code=types.INTERNAL_ERROR,
-                    message=f"Failed to read resource '{uri}': {str(e)}",
+                    message=f"Failed to read resource '{uri}': {e!s}",
                 )
             ) from e
 
@@ -293,7 +293,7 @@ class MCPClient:
             raise McpError(
                 error=types.ErrorData(
                     code=types.INTERNAL_ERROR,
-                    message=f"Tool call failed: {str(e)}",
+                    message=f"Tool call failed: {e!s}",
                 )
             ) from e
 
@@ -373,7 +373,7 @@ class LLMClient:
             logging.error(f"HTTP error: {e}")
             raise McpError(
                 error=types.ErrorData(
-                    code=types.INTERNAL_ERROR, message=f"HTTP error: {str(e)}"
+                    code=types.INTERNAL_ERROR, message=f"HTTP error: {e!s}"
                 )
             ) from e
         except KeyError as e:
@@ -381,7 +381,7 @@ class LLMClient:
             raise McpError(
                 error=types.ErrorData(
                     code=types.PARSE_ERROR,
-                    message=f"Unexpected response format: {str(e)}",
+                    message=f"Unexpected response format: {e!s}",
                 )
             ) from e
         except Exception as e:
@@ -389,7 +389,7 @@ class LLMClient:
             raise McpError(
                 error=types.ErrorData(
                     code=types.INTERNAL_ERROR,
-                    message=f"LLM API error: {str(e)}",
+                    message=f"LLM API error: {e!s}",
                 )
             ) from e
 
@@ -421,8 +421,6 @@ async def main() -> None:
     api_key = config.llm_api_key
 
     async with LLMClient(llm_config, api_key) as llm_client:
-        from src.websocket_server import run_websocket_server
-
         await run_websocket_server(clients, llm_client, config.get_config_dict())
 
 

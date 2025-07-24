@@ -113,7 +113,7 @@ class WebSocketServer:
                 json.dumps(
                     {
                         "status": "error",
-                        "chunk": {"error": f"Server error: {str(e)}"},
+                        "chunk": {"error": f"Server error: {e!s}"},
                     }
                 )
             )
@@ -199,7 +199,7 @@ class WebSocketServer:
                     {
                         "request_id": request_id,
                         "status": "error",
-                        "chunk": {"error": str(e)},
+                        "chunk": {"error": f"{e!s}"},
                     }
                 )
             )
