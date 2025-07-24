@@ -23,6 +23,7 @@ MANIFEST
 
 # Virtual environments
 .env
+.env.clean
 .venv
 env/
 venv/
