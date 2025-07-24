@@ -18,6 +18,7 @@ from mcp.client.stdio import stdio_client
 from pydantic import AnyUrl
 
 from src.config import Configuration
+from src.history.chat_store import JsonlRepo
 from src.websocket_server import run_websocket_server
 
 logging.basicConfig(
@@ -420,8 +421,11 @@ async def main() -> None:
     llm_config = config.get_llm_config()
     api_key = config.llm_api_key
 
+    # Create repository for chat history
+    repo = JsonlRepo("events.jsonl")
+
     async with LLMClient(llm_config, api_key) as llm_client:
-        await run_websocket_server(clients, llm_client, config.get_config_dict())
+        await run_websocket_server(clients, llm_client, config.get_config_dict(), repo)
 
 
 if __name__ == "__main__":

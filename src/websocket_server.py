@@ -14,11 +14,12 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+from src.chat_service import ChatService
+from src.history.chat_store import ChatRepository
+
 # TYPE_CHECKING imports to avoid circular imports
 if TYPE_CHECKING:
     from src.main import LLMClient, MCPClient
-
-from src.chat_service import ChatService
 
 logger = logging.getLogger(__name__)
 
@@ -40,13 +41,15 @@ class WebSocketServer:
         clients: list["MCPClient"],
         llm_client: "LLMClient",
         config: dict[str, Any],
+        repo: ChatRepository,
     ):
-        self.chat_service = ChatService(clients, llm_client, config)
+        self.chat_service = ChatService(clients, llm_client, config, repo=repo)
+        self.repo = repo
         self.config = config
         self.app = self._create_app()
         self.active_connections: list[WebSocket] = []
-        # Store conversation history per connection
-        self.conversation_histories: dict[WebSocket, list[dict[str, Any]]] = {}
+        # Store conversation id per socket
+        self.conversation_ids: dict[WebSocket, str] = {}
 
     def _create_app(self) -> FastAPI:
         """Create and configure FastAPI app."""
@@ -124,15 +127,14 @@ class WebSocketServer:
         self, websocket: WebSocket, message_data: dict[str, Any]
     ):
         """Handle a chat message from the frontend."""
-        # Extract message details
         request_id = message_data.get("request_id", str(uuid.uuid4()))
         payload = message_data.get("payload", {})
         user_message = payload.get("text", "")
+        model = payload.get("model")  # optional
 
         logger.info(f"Received chat message: {user_message[:50]}...")
 
         try:
-            # Send processing started message
             await websocket.send_text(
                 json.dumps(
                     {
@@ -143,54 +145,42 @@ class WebSocketServer:
                 )
             )
 
-            # Get conversation history for this connection
-            conversation_history = self.conversation_histories.get(websocket, [])
+            # get or assign conversation_id
+            conversation_id = self.conversation_ids.get(websocket)
+            if not conversation_id:
+                conversation_id = str(uuid.uuid4())
+                self.conversation_ids[websocket] = conversation_id
 
-            # Track if we got any responses
-            got_response = False
-            assistant_response = ""
-
-            # Process message through chat service and stream responses
-            async for chat_message in self.chat_service.process_message(
-                user_message, conversation_history
-            ):
-                got_response = True
-                logger.info(
-                    "Received chat message from service: "
-                    f"type={chat_message.type}, "
-                    f"content={chat_message.content[:50]}..."
-                )
-                await self._send_chat_response(websocket, request_id, chat_message)
-
-                # Track assistant response for conversation history
-                if chat_message.type == "text":
-                    assistant_response = chat_message.content
-
-            # Send completion message if we got responses
-            if got_response:
-                await websocket.send_text(
-                    json.dumps(
-                        {
-                            "request_id": request_id,
-                            "status": "complete",
-                            "chunk": {},
-                        }
-                    )
-                )
-
-            # Update conversation history
-            if websocket not in self.conversation_histories:
-                self.conversation_histories[websocket] = []
-
-            self.conversation_histories[websocket].append(
-                {"role": "user", "content": user_message}
+            # Non-streaming: single final assistant message
+            assistant_ev = await self.chat_service.chat_once(
+                conversation_id=conversation_id,
+                user_msg=user_message,
+                model=model,
             )
 
-            # Add assistant response to history if we got one
-            if assistant_response:
-                self.conversation_histories[websocket].append(
-                    {"role": "assistant", "content": assistant_response}
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "status": "chunk",
+                        "chunk": {
+                            "type": "text",
+                            "data": assistant_ev.content,
+                            "metadata": {},
+                        },
+                    }
                 )
+            )
+
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "status": "complete",
+                        "chunk": {},
+                    }
+                )
+            )
 
         except Exception as e:
             logger.error(f"Error processing chat message: {e}")
@@ -199,7 +189,7 @@ class WebSocketServer:
                     {
                         "request_id": request_id,
                         "status": "error",
-                        "chunk": {"error": f"{e!s}"},
+                        "chunk": {"error": str(e)},
                     }
                 )
             )
@@ -267,8 +257,8 @@ class WebSocketServer:
             logger.info(f"WebSocket connection attempt from {websocket.client}")
             await websocket.accept()
             self.active_connections.append(websocket)
-            # Initialize conversation history for this connection
-            self.conversation_histories[websocket] = []
+            # Initialize conversation id for this connection
+            self.conversation_ids[websocket] = str(uuid.uuid4())
             logger.info(
                 f"WebSocket connection established. Total connections: "
                 f"{len(self.active_connections)}"
@@ -281,9 +271,9 @@ class WebSocketServer:
         """Disconnect a WebSocket."""
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
-        # Clean up conversation history
-        if websocket in self.conversation_histories:
-            del self.conversation_histories[websocket]
+        # Clean up conversation id
+        if websocket in self.conversation_ids:
+            del self.conversation_ids[websocket]
         logger.info(
             f"WebSocket connection closed. Total connections: "
             f"{len(self.active_connections)}"
@@ -313,6 +303,7 @@ async def run_websocket_server(
     clients: list["MCPClient"],
     llm_client: "LLMClient",
     config: dict[str, Any],
+    repo: ChatRepository,
 ) -> None:
     """
     Run the WebSocket server.
@@ -320,5 +311,5 @@ async def run_websocket_server(
     This function maintains the same interface as before but now uses
     the clean separation between communication and business logic.
     """
-    server = WebSocketServer(clients, llm_client, config)
+    server = WebSocketServer(clients, llm_client, config, repo)
     await server.start_server()

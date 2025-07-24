@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING, Any
 
 from mcp import types
 
+from src.history.chat_store import ChatEvent, ChatRepository, estimate_tokens
+
 if TYPE_CHECKING:
     from src.main import LLMClient, MCPClient
     from src.tool_schema_manager import ToolSchemaManager
@@ -55,10 +57,14 @@ class ChatService:
         clients: list[MCPClient],
         llm_client: LLMClient,
         config: dict[str, Any],
+        repo: ChatRepository,
+        ctx_window: int = 4000,
     ):
         self.clients = clients
         self.llm_client = llm_client
         self.config = config
+        self.repo = repo
+        self.ctx_window = ctx_window
         self.chat_conf = config.get("chat", {}).get("service", {})
         self.tool_mgr: ToolSchemaManager | None = None
         self._init_lock = asyncio.Lock()
@@ -175,6 +181,101 @@ class ChatService:
                 yield ChatMessage(
                     "text", txt, {"finish_reason": assistant_msg.get("finish_reason")}
                 )
+
+    async def chat_once(
+        self,
+        conversation_id: str,
+        user_msg: str,
+        model: str | None = None,
+    ) -> ChatEvent:
+        """Non-streaming: persist user msg first, call LLM once, persist assistant."""
+        await self._ready.wait()
+
+        if not self.tool_mgr:
+            raise RuntimeError("Tool manager not initialized")
+
+        # 1) persist user message FIRST
+        user_ev = ChatEvent(
+            conversation_id=conversation_id,
+            type="user_message",
+            role="user",
+            content=user_msg,
+            token_count=estimate_tokens(user_msg),
+        )
+        self.repo.add_event(user_ev)
+
+        # 2) build canonical history from repo
+        events = self.repo.last_n_tokens(conversation_id, self.ctx_window)
+
+        # 3) convert to OpenAI-style list for your LLM call
+        conv: list[dict[str, Any]] = [
+            {"role": "system", "content": self._system_prompt},
+        ]
+        for ev in events:
+            if ev.type in ("user_message", "assistant_message", "system_update"):
+                conv.append({"role": ev.role, "content": ev.content})
+
+        conv.append({"role": "user", "content": user_msg})
+
+        tools_payload = self.tool_mgr.get_openai_tools()
+
+        # 4) same tool loop you already have, but no streaming outward
+        assistant_full_text = ""
+        reply = await self.llm_client.get_response_with_tools(conv, tools_payload)
+        assistant_msg = reply["message"]
+
+        if txt := assistant_msg.get("content"):
+            assistant_full_text += txt
+
+        while calls := assistant_msg.get("tool_calls"):
+            conv.append(
+                {
+                    "role": "assistant",
+                    "content": assistant_msg.get("content") or "",
+                    "tool_calls": calls,
+                }
+            )
+
+            for call in calls:
+                tool_name = call["function"]["name"]
+                args = json.loads(call["function"]["arguments"] or "{}")
+
+                result = await self.tool_mgr.call_tool(tool_name, args)
+                content = self._pluck_content(result)
+
+                conv.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "content": content,
+                    }
+                )
+
+            assistant_msg = (
+                await self.llm_client.get_response_with_tools(conv, tools_payload)
+            )["message"]
+
+            if txt := assistant_msg.get("content"):
+                assistant_full_text += txt
+
+        # 5) persist assistant message
+        assistant_ev = ChatEvent(
+            conversation_id=conversation_id,
+            type="assistant_message",
+            role="assistant",
+            content=assistant_full_text,
+            # usage info not available without changing LLMClient
+            provider="openai",  # or map from llm_client/config
+            model=(
+                self.llm_client.config.get("model")
+                if hasattr(self.llm_client, "config")
+                else model
+            ),
+            token_count=estimate_tokens(assistant_full_text),
+        )
+        self.repo.add_event(assistant_ev)
+
+        return assistant_ev
 
     def _pluck_content(self, res: types.CallToolResult) -> str:
         """Extract content from a tool call result."""
