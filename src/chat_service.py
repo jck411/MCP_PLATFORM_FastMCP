@@ -232,8 +232,8 @@ class ChatService:
         self,
         conversation_id: str,
         user_msg: str,
+        request_id: str,
         model: str | None = None,
-        request_id: str | None = None,
     ) -> ChatEvent:
         """Non-streaming: persist user msg first, call LLM once, persist assistant."""
         await self._ready.wait()
@@ -241,16 +241,15 @@ class ChatService:
         if not self.tool_mgr:
             raise RuntimeError("Tool manager not initialized")
 
-        # If request_id provided, check for existing response to prevent double-billing
-        if request_id:
-            existing_response = await self._get_existing_assistant_response(
-                conversation_id, request_id
+        # Check for existing response to prevent double-billing
+        existing_response = await self._get_existing_assistant_response(
+            conversation_id, request_id
+        )
+        if existing_response:
+            logger.info(
+                f"Returning cached response for request_id: {request_id}"
             )
-            if existing_response:
-                logger.info(
-                    f"Returning cached response for request_id: {request_id}"
-                )
-                return existing_response
+            return existing_response
 
         # 1) persist user message FIRST with idempotency check
         user_ev = ChatEvent(
@@ -258,13 +257,13 @@ class ChatService:
             type="user_message",
             role="user",
             content=user_msg,
-            extra={"request_id": request_id} if request_id else {},
+            extra={"request_id": request_id},
         )
         # Ensure token count is computed
         user_ev.compute_and_cache_tokens()
         was_added = await self.repo.add_event(user_ev)
 
-        if not was_added and request_id:
+        if not was_added:
             # User message already exists, check for assistant response again
             existing_response = await self._get_existing_assistant_response(
                 conversation_id, request_id
@@ -298,10 +297,6 @@ class ChatService:
         ) = await self._generate_assistant_response(conv)
 
         # 5) persist assistant message with usage and reference to user request
-        assistant_extra = {}
-        if request_id:
-            assistant_extra["user_request_id"] = request_id
-
         assistant_ev = ChatEvent(
             conversation_id=conversation_id,
             type="assistant_message",
@@ -310,7 +305,7 @@ class ChatService:
             usage=total_usage,
             provider="openai",  # or map from llm_client/config
             model=model,
-            extra=assistant_extra,
+            extra={"user_request_id": request_id},
         )
         # Ensure token count is computed
         assistant_ev.compute_and_cache_tokens()
@@ -611,22 +606,15 @@ class ChatService:
 
     async def cleanup(self) -> None:
         """Clean up resources by closing all connected MCP clients."""
-        # Only cleanup clients that are actually connected
-        if hasattr(self, 'tool_mgr') and self.tool_mgr:
-            # Get connected clients from tool manager
-            for client in self.tool_mgr.clients:
-                try:
-                    await client.close()
-                except Exception as e:
-                    logger.warning(f"Error closing client {client.name}: {e}")
-        else:
-            # Fallback: try to close all clients if tool_mgr isn't available
-            for client in self.clients:
-                try:
-                    if client.is_connected:
-                        await client.close()
-                except Exception as e:
-                    logger.warning(f"Error closing client {client.name}: {e}")
+        if not self.tool_mgr:
+            raise RuntimeError("Tool manager not initialized")
+
+        # Get connected clients from tool manager
+        for client in self.tool_mgr.clients:
+            try:
+                await client.close()
+            except Exception as e:
+                logger.warning(f"Error closing client {client.name}: {e}")
 
     async def apply_prompt(self, name: str, args: dict[str, str]) -> list[dict]:
         """Apply a parameterized prompt and return conversation messages."""

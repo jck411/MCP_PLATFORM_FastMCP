@@ -17,7 +17,7 @@ TOOL_CONFIG = {
     "math_tools": True,
     "advanced_math": True,
     "conversation_prompts": False,
-    "desktop_resources": False,
+    "desktop_resources": True,
 }
 
 # Create server

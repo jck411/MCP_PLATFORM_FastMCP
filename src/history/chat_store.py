@@ -21,7 +21,6 @@ Features:
 - Conversation-based organization
 - Thread-safe operations
 - Async/await support
-- Backward compatibility exports
 
 The module follows the MCP Platform's standards with:
 - Pydantic v2 for data validation and serialization
@@ -43,15 +42,6 @@ from typing import Any, Literal, Protocol
 from pydantic import BaseModel, Field
 
 from src.history.token_counter import estimate_tokens
-
-# Re-export for backward compatibility
-__all__ = [
-    "ChatEvent",
-    "ChatRepository",
-    "InMemoryRepo",
-    "JsonlRepo",
-    "estimate_tokens",
-]
 
 # ---------- Canonical models (Pydantic v2) ----------
 

@@ -127,7 +127,18 @@ class WebSocketServer:
         self, websocket: WebSocket, message_data: dict[str, Any]
     ):
         """Handle a chat message from the frontend."""
-        request_id = message_data.get("request_id", str(uuid.uuid4()))
+        request_id = message_data.get("request_id")
+        if not request_id:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "chunk": {"error": "request_id is required"},
+                    }
+                )
+            )
+            return
+
         payload = message_data.get("payload", {})
         user_message = payload.get("text", "")
         model = payload.get("model")  # optional

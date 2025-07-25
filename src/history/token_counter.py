@@ -27,14 +27,7 @@ DEFAULT_ENCODING = "cl100k_base"  # Used by GPT-4, GPT-3.5-turbo
 @lru_cache(maxsize=32)  # Cache encodings since they're expensive to create
 def _get_encoding(encoding_name: str) -> tiktoken.Encoding:
     """Get tiktoken encoding with caching."""
-    try:
-        return tiktoken.get_encoding(encoding_name)
-    except Exception as e:
-        logger.warning(
-            f"Failed to get encoding '{encoding_name}', falling back to "
-            f"default: {e}"
-        )
-        return tiktoken.get_encoding(DEFAULT_ENCODING)
+    return tiktoken.get_encoding(encoding_name)
 
 
 class TokenCounter:
@@ -70,20 +63,13 @@ class TokenCounter:
         if content_hash in _token_cache:
             return _token_cache[content_hash]
 
-        try:
-            # Count tokens using tiktoken
-            tokens = len(self._encoding.encode(text))
+        # Count tokens using tiktoken
+        tokens = len(self._encoding.encode(text))
 
-            # Cache the result
-            _token_cache[content_hash] = tokens
+        # Cache the result
+        _token_cache[content_hash] = tokens
 
-            return tokens
-        except Exception as e:
-            logger.warning(f"Token counting failed, using fallback: {e}")
-            # Fallback to word-based estimation
-            fallback_count = max(1, int(len(text.split()) / 0.75))
-            _token_cache[content_hash] = fallback_count
-            return fallback_count
+        return tokens
 
     def count_messages_tokens(self, messages: list[dict[str, Any]]) -> int:
         """
