@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from mcp import types
 
-from src.history.chat_store import ChatEvent, ChatRepository, estimate_tokens
+from src.history.chat_store import ChatEvent, ChatRepository, Usage
 
 if TYPE_CHECKING:
     from src.main import LLMClient, MCPClient
@@ -27,6 +27,9 @@ else:
     from src.tool_schema_manager import ToolSchemaManager
 
 logger = logging.getLogger(__name__)
+
+# Maximum number of tool call hops to prevent infinite recursion
+MAX_TOOL_HOPS = 8
 
 
 class ChatMessage:
@@ -147,7 +150,20 @@ class ChatService:
                 "text", txt, {"finish_reason": assistant_msg.get("finish_reason")}
             )
 
+        hops = 0
         while calls := assistant_msg.get("tool_calls"):
+            if hops >= MAX_TOOL_HOPS:
+                logger.warning(
+                    f"Maximum tool hops ({MAX_TOOL_HOPS}) reached, stopping recursion"
+                )
+                yield ChatMessage(
+                    "text",
+                    f"⚠️ Reached maximum tool call limit ({MAX_TOOL_HOPS}). "
+                    "Stopping to prevent infinite recursion.",
+                    {"finish_reason": "tool_limit_reached"},
+                )
+                break
+
             conv.append(
                 {
                     "role": "assistant",
@@ -181,6 +197,8 @@ class ChatService:
                 yield ChatMessage(
                     "text", txt, {"finish_reason": assistant_msg.get("finish_reason")}
                 )
+
+            hops += 1
 
     async def _get_existing_assistant_response(
         self, conversation_id: str, request_id: str
@@ -226,9 +244,10 @@ class ChatService:
             type="user_message",
             role="user",
             content=user_msg,
-            token_count=estimate_tokens(user_msg),
             extra={"request_id": request_id} if request_id else {},
         )
+        # Ensure token count is computed
+        user_ev.compute_and_cache_tokens()
         was_added = await self.repo.add_event(user_ev)
 
         if not was_added and request_id:
@@ -257,10 +276,14 @@ class ChatService:
 
         conv.append({"role": "user", "content": user_msg})
 
-        # 4) Generate assistant response
-        assistant_full_text = await self._generate_assistant_response(conv)
+        # 4) Generate assistant response with usage tracking
+        (
+            assistant_full_text,
+            total_usage,
+            model
+        ) = await self._generate_assistant_response(conv)
 
-        # 5) persist assistant message with reference to user request
+        # 5) persist assistant message with usage and reference to user request
         assistant_extra = {}
         if request_id:
             assistant_extra["user_request_id"] = request_id
@@ -270,23 +293,31 @@ class ChatService:
             type="assistant_message",
             role="assistant",
             content=assistant_full_text,
-            # usage info not available without changing LLMClient
+            usage=total_usage,
             provider="openai",  # or map from llm_client/config
-            model=(
-                self.llm_client.config.get("model")
-                if hasattr(self.llm_client, "config")
-                else model
-            ),
-            token_count=estimate_tokens(assistant_full_text),
+            model=model,
             extra=assistant_extra,
         )
+        # Ensure token count is computed
+        assistant_ev.compute_and_cache_tokens()
         await self.repo.add_event(assistant_ev)
 
         return assistant_ev
 
+    def _convert_usage(self, api_usage: dict[str, Any] | None) -> Usage:
+        """Convert LLM API usage to our Usage model."""
+        if not api_usage:
+            return Usage()
+
+        return Usage(
+            prompt_tokens=api_usage.get("prompt_tokens", 0),
+            completion_tokens=api_usage.get("completion_tokens", 0),
+            total_tokens=api_usage.get("total_tokens", 0),
+        )
+
     async def _generate_assistant_response(
         self, conv: list[dict[str, Any]]
-    ) -> str:
+    ) -> tuple[str, Usage, str]:
         """Generate assistant response using tools if needed."""
         if not self.tool_mgr:
             raise RuntimeError("Tool manager not initialized")
@@ -294,13 +325,37 @@ class ChatService:
         tools_payload = self.tool_mgr.get_openai_tools()
 
         assistant_full_text = ""
+        total_usage = Usage()
+        model = ""
+
         reply = await self.llm_client.get_response_with_tools(conv, tools_payload)
         assistant_msg = reply["message"]
+
+        # Track usage from this API call
+        if reply.get("usage"):
+            call_usage = self._convert_usage(reply["usage"])
+            total_usage.prompt_tokens += call_usage.prompt_tokens
+            total_usage.completion_tokens += call_usage.completion_tokens
+            total_usage.total_tokens += call_usage.total_tokens
+
+        # Store model from first API call
+        model = reply.get("model", "")
 
         if txt := assistant_msg.get("content"):
             assistant_full_text += txt
 
+        hops = 0
         while calls := assistant_msg.get("tool_calls"):
+            if hops >= MAX_TOOL_HOPS:
+                logger.warning(
+                    f"Maximum tool hops ({MAX_TOOL_HOPS}) reached, stopping recursion"
+                )
+                assistant_full_text += (
+                    f"\n\n⚠️ Reached maximum tool call limit ({MAX_TOOL_HOPS}). "
+                    "Stopping to prevent infinite recursion."
+                )
+                break
+
             conv.append(
                 {
                     "role": "assistant",
@@ -324,14 +379,22 @@ class ChatService:
                     }
                 )
 
-            assistant_msg = (
-                await self.llm_client.get_response_with_tools(conv, tools_payload)
-            )["message"]
+            reply = await self.llm_client.get_response_with_tools(conv, tools_payload)
+            assistant_msg = reply["message"]
+
+            # Track usage from subsequent API calls
+            if reply.get("usage"):
+                call_usage = self._convert_usage(reply["usage"])
+                total_usage.prompt_tokens += call_usage.prompt_tokens
+                total_usage.completion_tokens += call_usage.completion_tokens
+                total_usage.total_tokens += call_usage.total_tokens
 
             if txt := assistant_msg.get("content"):
                 assistant_full_text += txt
 
-        return assistant_full_text
+            hops += 1
+
+        return assistant_full_text, total_usage, model
 
     def _pluck_content(self, res: types.CallToolResult) -> str:
         """Extract content from a tool call result."""

@@ -33,6 +33,7 @@ Your MCP client is **fully implemented** and ready to connect to new FastMCP ser
 - ✅ **Parameter Validation**: Pydantic-based validation for all tool parameters
 - ✅ **Error Handling**: Proper MCP error codes and graceful failure handling
 - ✅ **Real-time Communication**: WebSocket interface for responsive frontends
+- ✅ **Accurate Token Counting**: tiktoken-based token accounting with caching for precise context management
 
 ## 🚀 Ready for FastMCP Servers
 
@@ -227,6 +228,53 @@ uv sync --upgrade
 
 # Update Python version (if needed)
 uv python install 3.12  # or latest stable
+```
+
+## 🔢 Token Accounting System
+
+The platform includes a robust token counting system that ensures accurate context management:
+
+### **Features**
+
+- **🎯 Accurate Counting**: Uses tiktoken (OpenAI's tokenizer) for precise token counts
+- **⚡ Performance Optimized**: Content-based caching prevents redundant computations
+- **🔄 Automatic Windowing**: `last_n_tokens()` intelligently manages context windows
+- **📊 Multiple Encodings**: Support for different model encodings (cl100k_base, etc.)
+
+### **Key Components**
+
+```python
+# Automatic token counting for all chat events
+event = ChatEvent(content="Your message here")
+event.compute_and_cache_tokens()  # Uses tiktoken, caches result
+
+# Context windowing with proper token limits
+events = await repo.last_n_tokens(conversation_id, max_tokens=4000)
+
+# Token-aware conversation building
+from src.history.conversation_utils import build_conversation_with_token_limit
+
+conversation, token_count = build_conversation_with_token_limit(
+    system_prompt="You are a helpful assistant",
+    events=history_events,
+    user_message="What can you help me with?",
+    max_tokens=4000,
+    reserve_tokens=500  # Reserve space for response
+)
+```
+
+### **Benefits**
+
+- **Prevents Context Errors**: No more "context length exceeded" surprises
+- **Optimizes Performance**: Caching eliminates redundant token computations
+- **Improves Reliability**: Accurate windowing ensures consistent behavior
+- **Better User Experience**: Predictable context management
+
+### **Testing the Token System**
+
+```bash
+# Run the token counting demonstration
+uv run python test_token_fix.py
 ```
 
 ---

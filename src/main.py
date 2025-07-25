@@ -369,6 +369,8 @@ class LLMClient:
                 "message": choice["message"],
                 "finish_reason": choice.get("finish_reason"),
                 "index": choice.get("index", 0),
+                "usage": result.get("usage"),
+                "model": result.get("model", self.config["model"]),
             }
         except httpx.HTTPError as e:
             logging.error(f"HTTP error: {e}")

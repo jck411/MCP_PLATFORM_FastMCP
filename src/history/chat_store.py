@@ -12,6 +12,17 @@ from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
+from src.history.token_counter import estimate_tokens
+
+# Re-export for backward compatibility
+__all__ = [
+    "ChatEvent",
+    "ChatRepository",
+    "InMemoryRepo",
+    "JsonlRepo",
+    "estimate_tokens",
+]
+
 # ---------- Canonical models (Pydantic v2) ----------
 
 Role = Literal["system", "user", "assistant", "tool"]
@@ -56,11 +67,32 @@ class ChatEvent(BaseModel):
     extra: dict[str, Any] = Field(default_factory=dict)
     raw: Any | None = None  # keep small; move big things elsewhere later
 
-# ---------- Token estimation helper ----------
+    def compute_and_cache_tokens(self) -> int:
+        """Compute and cache token count for this event's content."""
+        if self.content is None:
+            self.token_count = 0
+            return 0
 
-def estimate_tokens(text: str) -> int:
-    # crude placeholder; replace with tiktoken or provider counter later
-    return max(1, int(len(text.split()) / 0.75))
+        if isinstance(self.content, str):
+            text_content = self.content
+        elif isinstance(self.content, list):
+            # Handle list of Parts (for future extensibility)
+            text_parts = []
+            for part in self.content:
+                if isinstance(part, TextPart):
+                    text_parts.append(part.text)
+            text_content = " ".join(text_parts)
+        else:
+            text_content = str(self.content)
+
+        self.token_count = estimate_tokens(text_content)
+        return self.token_count
+
+    def ensure_token_count(self) -> int:
+        """Ensure token count is computed and return it."""
+        if self.token_count is None:
+            return self.compute_and_cache_tokens()
+        return self.token_count
 
 # ---------- Repository interface ----------
 
@@ -117,7 +149,8 @@ class InMemoryRepo(ChatRepository):
             acc: list[ChatEvent] = []
             total = 0
             for ev in reversed(events):
-                tok = ev.token_count or 0
+                # Ensure token count is computed
+                tok = ev.ensure_token_count()
                 if total + tok > max_tokens:
                     break
                 acc.append(ev)
@@ -218,7 +251,8 @@ class JsonlRepo(ChatRepository):
             acc: list[ChatEvent] = []
             total = 0
             for ev in reversed(events):
-                tok = ev.token_count or 0
+                # Ensure token count is computed
+                tok = ev.ensure_token_count()
                 if total + tok > max_tokens:
                     break
                 acc.append(ev)
