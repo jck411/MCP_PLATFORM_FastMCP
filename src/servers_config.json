@@ -1,46 +1,26 @@
 {
+  "_comment": "MCP Platform Server Configuration - Primary configuration location",
+  "_usage": "Add or remove MCP servers here. Tool configuration is handled by each server",
   "mcpServers": {
     "demo": {
       "enabled": true,
       "command": "uv",
       "args": ["run", "python", "Servers/demo_server.py"],
-      "env": {},
-      "cwd": "/home/jack/MCP_PLATFORM_FastMCP",
-      "capabilities": {
-        "tools": true,
-        "prompts": true,
-        "resources": true,
-        "logging": true,
-        "completions": true
-      }
+      "cwd": "/home/jack/MCP_PLATFORM_FastMCP"
     },
     "template": {
+      "_comment": "Disabled server - useful for testing",
       "enabled": false,
       "command": "uv",
       "args": ["run", "python", "Servers/demo_resources_server.py"],
-      "env": {},
-      "cwd": "/home/jack/MCP_PLATFORM_FastMCP",
-      "capabilities": {
-        "tools": true,
-        "prompts": true,
-        "resources": true,
-        "logging": true,
-        "completions": true
-      }
+      "cwd": "/home/jack/MCP_PLATFORM_FastMCP"
     },
     "demo_prompt": {
-      "enabled": true,
+      "_comment": "Prompt-only server - no tools or resources",
+      "enabled": false,
       "command": "uv",
       "args": ["run", "python", "Servers/demo_prompt_server.py"],
-      "env": {},
-      "cwd": "/home/jack/MCP_PLATFORM_FastMCP",
-      "capabilities": {
-        "tools": false,
-        "prompts": true,
-        "resources": false,
-        "logging": true,
-        "completions": true
-      }
+      "cwd": "/home/jack/MCP_PLATFORM_FastMCP"
     }
   },
   "settings": {

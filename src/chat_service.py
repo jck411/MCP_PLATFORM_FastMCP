@@ -95,14 +95,16 @@ class ChatService:
                     connected_clients.append(self.clients[i])
 
             if not connected_clients:
-                raise RuntimeError("No MCP clients successfully connected")
+                logger.warning(
+                    "No MCP clients connected - running with basic functionality"
+                )
+            else:
+                logger.info(
+                    f"Successfully connected to {len(connected_clients)} out of "
+                    f"{len(self.clients)} MCP clients"
+                )
 
-            logger.info(
-                f"Successfully connected to {len(connected_clients)} out of "
-                f"{len(self.clients)} MCP clients"
-            )
-
-            # Use only connected clients for tool management
+            # Use connected clients for tool management (empty list is acceptable)
             self.tool_mgr = ToolSchemaManager(connected_clients)
             await self.tool_mgr.initialize()
 
@@ -118,7 +120,12 @@ class ChatService:
             )
 
             logger.info("Resource catalog: %s", self._resource_catalog)
-            logger.info("System prompt being used:\n%s", self._system_prompt)
+
+            # Configurable system prompt logging
+            if self.chat_conf.get("logging", {}).get("system_prompt", True):
+                logger.info("System prompt being used:\n%s", self._system_prompt)
+            else:
+                logger.debug("System prompt logging disabled in configuration")
 
             self._ready.set()
 
@@ -143,6 +150,9 @@ class ChatService:
 
         reply = await self.llm_client.get_response_with_tools(conv, tools_payload)
         assistant_msg = reply["message"]
+
+        # Log LLM reply if configured
+        self._log_llm_reply(reply, "Streaming initial response")
 
         if txt := assistant_msg.get("content"):
             yield ChatMessage(
@@ -188,9 +198,14 @@ class ChatService:
                     }
                 )
 
-            assistant_msg = (
+            assistant_reply = (
                 await self.llm_client.get_response_with_tools(conv, tools_payload)
-            )["message"]
+            )
+            assistant_msg = assistant_reply["message"]
+
+            # Log LLM reply if configured
+            context = f"Streaming tool follow-up (hop {hops + 1})"
+            self._log_llm_reply(assistant_reply, context)
 
             if txt := assistant_msg.get("content"):
                 yield ChatMessage(
@@ -330,6 +345,9 @@ class ChatService:
         reply = await self.llm_client.get_response_with_tools(conv, tools_payload)
         assistant_msg = reply["message"]
 
+        # Log LLM reply if configured
+        self._log_llm_reply(reply, "Initial LLM response")
+
         # Track usage from this API call
         if reply.get("usage"):
             call_usage = self._convert_usage(reply["usage"])
@@ -381,6 +399,9 @@ class ChatService:
             reply = await self.llm_client.get_response_with_tools(conv, tools_payload)
             assistant_msg = reply["message"]
 
+            # Log LLM reply if configured
+            self._log_llm_reply(reply, f"Tool call follow-up response (hop {hops + 1})")
+
             # Track usage from subsequent API calls
             if reply.get("usage"):
                 call_usage = self._convert_usage(reply["usage"])
@@ -394,6 +415,46 @@ class ChatService:
             hops += 1
 
         return assistant_full_text, total_usage, model
+
+    def _log_llm_reply(self, reply: dict[str, Any], context: str) -> None:
+        """Log LLM reply if configured."""
+        if not self.chat_conf.get("logging", {}).get("llm_replies", False):
+            return
+
+        message = reply.get("message", {})
+        content = message.get("content", "")
+        tool_calls = message.get("tool_calls", [])
+
+        # Truncate content if configured
+        logging_config = self.chat_conf.get("logging", {})
+        truncate_length = logging_config.get("llm_reply_truncate_length", 500)
+        if content and len(content) > truncate_length:
+            content = content[:truncate_length] + "..."
+
+        log_parts = [f"LLM Reply ({context}):"]
+
+        if content:
+            log_parts.append(f"Content: {content}")
+
+        if tool_calls:
+            log_parts.append(f"Tool calls: {len(tool_calls)}")
+            for i, call in enumerate(tool_calls):
+                func_name = call.get("function", {}).get("name", "unknown")
+                log_parts.append(f"  - Tool {i+1}: {func_name}")
+
+        usage = reply.get("usage", {})
+        if usage:
+            prompt_tokens = usage.get('prompt_tokens', 0)
+            completion_tokens = usage.get('completion_tokens', 0)
+            total_tokens = usage.get('total_tokens', 0)
+            log_parts.append(
+                f"Usage: {prompt_tokens}p + {completion_tokens}c = {total_tokens}t"
+            )
+
+        model = reply.get("model", "unknown")
+        log_parts.append(f"Model: {model}")
+
+        logger.info(" | ".join(log_parts))
 
     def _pluck_content(self, res: types.CallToolResult) -> str:
         """Extract content from a tool call result."""

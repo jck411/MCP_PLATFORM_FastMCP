@@ -22,8 +22,7 @@ chat:
     # System prompt configuration
     system_prompt: |
       You are a helpful assistant with a sense of humor.
-      You have access to to a list of tools.
-      Choose the appropriate tool for tasks.
+      You have access to to a list of tools, use them when needed and explain why you used them.
 
     # Tool execution notifications
     tool_notifications:
@@ -38,6 +37,9 @@ chat:
       tool_execution: true
       tool_results: true
       result_truncate_length: 200
+      system_prompt: true  # Log the generated system prompt during initialization
+      llm_replies: true  # Log ALL LLM replies including internal ones not sent to user
+      llm_reply_truncate_length: 500  # Truncate length for LLM reply logs
 
 # LLM Configuration - Just change the 'active' provider!
 llm:
