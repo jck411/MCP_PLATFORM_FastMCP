@@ -182,11 +182,26 @@ class ChatService:
                     "text", txt, {"finish_reason": assistant_msg.get("finish_reason")}
                 )
 
+    async def _get_existing_assistant_response(
+        self, conversation_id: str, request_id: str
+    ) -> ChatEvent | None:
+        """Get existing assistant response for a request_id if it exists."""
+        existing_assistant_id = await self.repo.get_last_assistant_reply_id(
+            conversation_id, request_id
+        )
+        if existing_assistant_id:
+            events = await self.repo.get_events(conversation_id)
+            for event in events:
+                if event.id == existing_assistant_id:
+                    return event
+        return None
+
     async def chat_once(
         self,
         conversation_id: str,
         user_msg: str,
         model: str | None = None,
+        request_id: str | None = None,
     ) -> ChatEvent:
         """Non-streaming: persist user msg first, call LLM once, persist assistant."""
         await self._ready.wait()
@@ -194,18 +209,43 @@ class ChatService:
         if not self.tool_mgr:
             raise RuntimeError("Tool manager not initialized")
 
-        # 1) persist user message FIRST
+        # If request_id provided, check for existing response to prevent double-billing
+        if request_id:
+            existing_response = await self._get_existing_assistant_response(
+                conversation_id, request_id
+            )
+            if existing_response:
+                logger.info(
+                    f"Returning cached response for request_id: {request_id}"
+                )
+                return existing_response
+
+        # 1) persist user message FIRST with idempotency check
         user_ev = ChatEvent(
             conversation_id=conversation_id,
             type="user_message",
             role="user",
             content=user_msg,
             token_count=estimate_tokens(user_msg),
+            extra={"request_id": request_id} if request_id else {},
         )
-        self.repo.add_event(user_ev)
+        was_added = await self.repo.add_event(user_ev)
+
+        if not was_added and request_id:
+            # User message already exists, check for assistant response again
+            existing_response = await self._get_existing_assistant_response(
+                conversation_id, request_id
+            )
+            if existing_response:
+                logger.info(
+                    "Returning existing response for duplicate "
+                    f"request_id: {request_id}"
+                )
+                return existing_response
+            # No assistant response yet, continue with LLM call
 
         # 2) build canonical history from repo
-        events = self.repo.last_n_tokens(conversation_id, self.ctx_window)
+        events = await self.repo.last_n_tokens(conversation_id, self.ctx_window)
 
         # 3) convert to OpenAI-style list for your LLM call
         conv: list[dict[str, Any]] = [
@@ -217,9 +257,42 @@ class ChatService:
 
         conv.append({"role": "user", "content": user_msg})
 
+        # 4) Generate assistant response
+        assistant_full_text = await self._generate_assistant_response(conv)
+
+        # 5) persist assistant message with reference to user request
+        assistant_extra = {}
+        if request_id:
+            assistant_extra["user_request_id"] = request_id
+
+        assistant_ev = ChatEvent(
+            conversation_id=conversation_id,
+            type="assistant_message",
+            role="assistant",
+            content=assistant_full_text,
+            # usage info not available without changing LLMClient
+            provider="openai",  # or map from llm_client/config
+            model=(
+                self.llm_client.config.get("model")
+                if hasattr(self.llm_client, "config")
+                else model
+            ),
+            token_count=estimate_tokens(assistant_full_text),
+            extra=assistant_extra,
+        )
+        await self.repo.add_event(assistant_ev)
+
+        return assistant_ev
+
+    async def _generate_assistant_response(
+        self, conv: list[dict[str, Any]]
+    ) -> str:
+        """Generate assistant response using tools if needed."""
+        if not self.tool_mgr:
+            raise RuntimeError("Tool manager not initialized")
+
         tools_payload = self.tool_mgr.get_openai_tools()
 
-        # 4) same tool loop you already have, but no streaming outward
         assistant_full_text = ""
         reply = await self.llm_client.get_response_with_tools(conv, tools_payload)
         assistant_msg = reply["message"]
@@ -258,24 +331,7 @@ class ChatService:
             if txt := assistant_msg.get("content"):
                 assistant_full_text += txt
 
-        # 5) persist assistant message
-        assistant_ev = ChatEvent(
-            conversation_id=conversation_id,
-            type="assistant_message",
-            role="assistant",
-            content=assistant_full_text,
-            # usage info not available without changing LLMClient
-            provider="openai",  # or map from llm_client/config
-            model=(
-                self.llm_client.config.get("model")
-                if hasattr(self.llm_client, "config")
-                else model
-            ),
-            token_count=estimate_tokens(assistant_full_text),
-        )
-        self.repo.add_event(assistant_ev)
-
-        return assistant_ev
+        return assistant_full_text
 
     def _pluck_content(self, res: types.CallToolResult) -> str:
         """Extract content from a tool call result."""

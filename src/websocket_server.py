@@ -156,6 +156,7 @@ class WebSocketServer:
                 conversation_id=conversation_id,
                 user_msg=user_message,
                 model=model,
+                request_id=request_id,
             )
 
             await websocket.send_text(

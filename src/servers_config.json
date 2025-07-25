@@ -15,7 +15,7 @@
       }
     },
     "template": {
-      "enabled": true,
+      "enabled": false,
       "command": "uv",
       "args": ["run", "python", "Servers/demo_resources_server.py"],
       "env": {},
