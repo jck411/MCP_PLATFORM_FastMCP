@@ -106,9 +106,8 @@ class ChatService:
             self.tool_mgr = ToolSchemaManager(connected_clients)
             await self.tool_mgr.initialize()
 
-            self._resource_catalog = sorted(
-                self.tool_mgr.list_available_resources()
-            )
+            # Update resource catalog to only include available resources
+            await self._update_resource_catalog_on_availability()
             self._system_prompt = await self._make_system_prompt()
 
             logger.info(
@@ -433,29 +432,25 @@ class ChatService:
 
         assert self.tool_mgr is not None
 
-        if self._resource_catalog:
+        # Only include resources that are actually available
+        available_resources = await self._get_available_resources()
+        if available_resources:
             base += "\n\n**Available Resources:**"
-            for uri in self._resource_catalog:
-                try:
-                    resource_result = await self.tool_mgr.read_resource(uri)
-                    if resource_result.contents:
-                        resource_info = self.tool_mgr.get_resource_info(uri)
-                        name = resource_info.resource.name if resource_info else uri
+            for uri, content_info in available_resources.items():
+                resource_info = self.tool_mgr.get_resource_info(uri)
+                name = resource_info.resource.name if resource_info else uri
 
-                        base += f"\n\n**{name}** ({uri}):"
+                base += f"\n\n**{name}** ({uri}):"
 
-                        for content in resource_result.contents:
-                            if isinstance(content, types.TextResourceContents):
-                                lines = content.text.strip().split('\n')
-                                for line in lines:
-                                    base += f"\n{line}"
-                            elif isinstance(content, types.BlobResourceContents):
-                                base += f"\n[Binary content: {len(content.blob)} bytes]"
-                            else:
-                                base += f"\n[{type(content).__name__} available]"
-                except Exception as e:
-                    logger.warning(f"Could not read resource {uri}: {e}")
-                    base += f"\n\n**{uri}**: Resource temporarily unavailable"
+                for content in content_info:
+                    if isinstance(content, types.TextResourceContents):
+                        lines = content.text.strip().split('\n')
+                        for line in lines:
+                            base += f"\n{line}"
+                    elif isinstance(content, types.BlobResourceContents):
+                        base += f"\n[Binary content: {len(content.blob)} bytes]"
+                    else:
+                        base += f"\n[{type(content).__name__} available]"
 
         prompt_names = self.tool_mgr.list_available_prompts()
         if prompt_names:
@@ -473,6 +468,85 @@ class ChatService:
             )
 
         return base
+
+    async def _get_available_resources(
+        self,
+    ) -> dict[str, list[types.TextResourceContents | types.BlobResourceContents]]:
+        """
+        Check resource availability and return only resources that can be read
+        successfully.
+
+        This implements graceful degradation by only including working resources
+        in the system prompt, following best practices for resource management.
+        """
+        available_resources: dict[
+            str, list[types.TextResourceContents | types.BlobResourceContents]
+        ] = {}
+
+        if not self._resource_catalog or not self.tool_mgr:
+            return available_resources
+
+        for uri in self._resource_catalog:
+            try:
+                resource_result = await self.tool_mgr.read_resource(uri)
+                if resource_result.contents:
+                    # Only include resources that have actual content
+                    available_resources[uri] = resource_result.contents
+                    logger.debug(f"Resource {uri} is available and loaded")
+                else:
+                    logger.debug(f"Resource {uri} has no content, skipping")
+            except Exception as e:
+                # Log the error but don't include in system prompt
+                # This prevents the LLM from being told about broken resources
+                logger.warning(
+                    f"Resource {uri} is unavailable and will be excluded "
+                    f"from system prompt: {e}"
+                )
+                continue
+
+        if available_resources:
+            logger.info(
+                f"Including {len(available_resources)} available resources "
+                f"in system prompt"
+            )
+        else:
+            logger.info(
+                "No resources are currently available - system prompt will not "
+                "include resource section"
+            )
+
+        return available_resources
+
+    async def _update_resource_catalog_on_availability(self) -> None:
+        """
+        Update the resource catalog to reflect current availability.
+
+        This implements a circuit-breaker-like pattern where we periodically
+        check if previously failed resources have become available again.
+        """
+        if not self.tool_mgr:
+            return
+
+        # Get all registered resources from the tool manager
+        all_resource_uris = self.tool_mgr.list_available_resources()
+
+        # Filter to only include resources that are actually available
+        available_uris = []
+        for uri in all_resource_uris:
+            try:
+                resource_result = await self.tool_mgr.read_resource(uri)
+                if resource_result.contents:
+                    available_uris.append(uri)
+            except Exception:
+                # Skip unavailable resources silently
+                continue
+
+        # Update the catalog to only include working resources
+        self._resource_catalog = available_uris
+        logger.debug(
+            f"Updated resource catalog: {len(available_uris)} of "
+            f"{len(all_resource_uris)} resources are available"
+        )
 
     async def cleanup(self) -> None:
         """Clean up resources by closing all connected MCP clients."""

@@ -1,4 +1,34 @@
 #!/usr/bin/env python3
+"""
+Chat History Storage Module
+
+This module provides a comprehensive chat event storage system for the MCP Platform.
+It manages conversation history, token counting, and persistent storage with multiple
+backend implementations.
+
+Key Components:
+- ChatEvent: Pydantic model representing individual chat messages, tool calls,
+  and system events
+- ChatRepository: Protocol defining the interface for chat storage backends
+- InMemoryRepo: Fast in-memory storage implementation for development/testing
+- JsonlRepo: Persistent JSONL file storage for production use
+
+Features:
+- Comprehensive event tracking (user messages, assistant responses, tool calls,
+  system updates)
+- Token counting and usage tracking for cost monitoring
+- Duplicate detection via request IDs
+- Conversation-based organization
+- Thread-safe operations
+- Async/await support
+- Backward compatibility exports
+
+The module follows the MCP Platform's standards with:
+- Pydantic v2 for data validation and serialization
+- Type hints on all functions and methods
+- Fail-fast error handling
+- Modern Python syntax (union types with |)
+"""
 from __future__ import annotations
 
 import asyncio

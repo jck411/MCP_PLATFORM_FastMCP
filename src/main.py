@@ -418,7 +418,11 @@ async def main() -> None:
 
     clients = []
     for name, server_config in servers_config["mcpServers"].items():
-        clients.append(MCPClient(name, server_config))
+        # Only create clients for enabled servers
+        if server_config.get("enabled", False):
+            clients.append(MCPClient(name, server_config))
+        else:
+            logging.info(f"Skipping disabled server: {name}")
 
     llm_config = config.get_llm_config()
     api_key = config.llm_api_key
