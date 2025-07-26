@@ -51,6 +51,7 @@ Thumbs.db
 # Logs
 *.log
 logs/
+events.jsonl
 
 # Coverage
 htmlcov/
