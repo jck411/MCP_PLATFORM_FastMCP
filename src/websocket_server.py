@@ -19,7 +19,8 @@ from src.history.chat_store import ChatRepository
 
 # TYPE_CHECKING imports to avoid circular imports
 if TYPE_CHECKING:
-    from src.main import LLMClient, MCPClient
+    from src.llm import LLMClient
+    from src.main import MCPClient
 
 logger = logging.getLogger(__name__)
 

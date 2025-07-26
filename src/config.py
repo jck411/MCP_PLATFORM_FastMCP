@@ -109,6 +109,14 @@ class Configuration:
 
         return providers[active_provider]
 
+    def get_full_llm_config(self) -> dict[str, Any]:
+        """Get full LLM configuration including active provider and all providers.
+
+        Returns:
+            Full LLM configuration dictionary.
+        """
+        return self._config.get("llm", {})
+
     def get_websocket_config(self) -> dict[str, Any]:
         """Get WebSocket configuration from YAML.
 

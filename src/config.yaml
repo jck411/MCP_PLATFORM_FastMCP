@@ -26,7 +26,7 @@ chat:
 
     # Streaming configuration
     streaming:
-      enabled: true  # Enable streaming by default (required setting)
+      enabled: false  # Enable streaming by default (required setting)
 
     # Tool execution notifications
     tool_notifications:
@@ -47,7 +47,7 @@ chat:
 
 # LLM Configuration - Just change the 'active' provider!
 llm:
-  active: "openai"  # Change this to: openai, groq, openrouter, anthropic, azure
+  active: "anthropic"  # Change this to: openai, groq, openrouter, anthropic, azure
 
   # Provider presets
   providers:
@@ -74,7 +74,7 @@ llm:
 
     anthropic:
       base_url: "https://api.anthropic.com/v1"
-      model: "claude-3-sonnet-20240229"  # or claude-3-5-sonnet-latest, etc.
+      model: "claude-3-5-sonnet-20241022"  # Updated to current model
       temperature: 0.7
       max_tokens: 4096
       top_p: 1.0

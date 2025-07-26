@@ -21,7 +21,8 @@ from mcp import types
 from src.history.chat_store import ChatEvent, ChatRepository, Usage
 
 if TYPE_CHECKING:
-    from src.main import LLMClient, MCPClient
+    from src.llm import LLMClient
+    from src.main import MCPClient
     from src.tool_schema_manager import ToolSchemaManager
 else:
     from src.tool_schema_manager import ToolSchemaManager
@@ -170,7 +171,7 @@ class ChatService:
         reply_data = {
             "message": assistant_msg,
             "usage": None,  # Usage not available in streaming mode
-            "model": self.llm_client.config.get("model", "")
+            "model": self.llm_client.model
         }
         self._log_llm_reply(reply_data, "Streaming initial response")
 
@@ -213,7 +214,7 @@ class ChatService:
             reply_data = {
                 "message": assistant_msg,
                 "usage": None,  # Usage not available in streaming mode
-                "model": self.llm_client.config.get("model", "")
+                "model": self.llm_client.model
             }
             context = f"Streaming tool follow-up (hop {hops + 1})"
             self._log_llm_reply(reply_data, context)
@@ -381,7 +382,7 @@ class ChatService:
             if ev.type in ("user_message", "assistant_message", "system_update"):
                 conv.append({"role": ev.role, "content": ev.content})
 
-        conv.append({"role": "user", "content": user_msg})
+        # User message is already included in events since we persisted it above
 
         # 4) Generate assistant response with usage tracking
         (
