@@ -24,6 +24,10 @@ chat:
       You are a helpful assistant with a sense of humor.
       You have access to to a list of tools, use them when needed and explain why you used them.
 
+    # Streaming configuration
+    streaming:
+      enabled: true  # Enable streaming by default (required setting)
+
     # Tool execution notifications
     tool_notifications:
       enabled: true

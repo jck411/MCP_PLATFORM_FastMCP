@@ -143,6 +143,37 @@ class WebSocketServer:
         user_message = payload.get("text", "")
         model = payload.get("model")  # optional
 
+        # Check streaming configuration - FAIL FAST approach
+        service_config = self.config.get("chat", {}).get("service", {})
+        streaming_config = service_config.get("streaming", {})
+
+        if "streaming" in payload:
+            # Client explicitly set streaming preference - use it
+            streaming = payload["streaming"]
+        elif streaming_config.get("enabled") is not None:
+            # Use configured default - must be explicitly set
+            streaming = streaming_config["enabled"]
+        else:
+            # FAIL FAST: No streaming configuration found
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "status": "error",
+                        "chunk": {
+                            "error": (
+                                "Streaming configuration missing. "
+                                "Set 'chat.service.streaming.enabled' in config.yaml "
+                                "or specify 'streaming: true/false' in payload."
+                            )
+                        },
+                    }
+                )
+            )
+            return
+
+        logger.info(f"Processing message with streaming={streaming}")
+
         logger.info(f"Received chat message: {user_message[:50]}...")
 
         try:
@@ -162,37 +193,16 @@ class WebSocketServer:
                 conversation_id = str(uuid.uuid4())
                 self.conversation_ids[websocket] = conversation_id
 
-            # Non-streaming: single final assistant message
-            assistant_ev = await self.chat_service.chat_once(
-                conversation_id=conversation_id,
-                user_msg=user_message,
-                model=model,
-                request_id=request_id,
-            )
-
-            await websocket.send_text(
-                json.dumps(
-                    {
-                        "request_id": request_id,
-                        "status": "chunk",
-                        "chunk": {
-                            "type": "text",
-                            "data": assistant_ev.content,
-                            "metadata": {},
-                        },
-                    }
+            if streaming:
+                # Streaming mode: real-time chunks
+                await self._handle_streaming_chat(
+                    websocket, request_id, conversation_id, user_message
                 )
-            )
-
-            await websocket.send_text(
-                json.dumps(
-                    {
-                        "request_id": request_id,
-                        "status": "complete",
-                        "chunk": {},
-                    }
+            else:
+                # Non-streaming mode: single final assistant message
+                await self._handle_non_streaming_chat(
+                    websocket, request_id, conversation_id, user_message, model
                 )
-            )
 
         except Exception as e:
             logger.error(f"Error processing chat message: {e}")
@@ -205,6 +215,80 @@ class WebSocketServer:
                     }
                 )
             )
+
+    async def _handle_streaming_chat(
+        self,
+        websocket: WebSocket,
+        request_id: str,
+        conversation_id: str,
+        user_message: str,
+    ):
+        """Handle streaming chat response."""
+        # Get chat history for this conversation
+        events = await self.repo.last_n_tokens(conversation_id, 4000)
+
+        # Convert to OpenAI-style history
+        history = []
+        for ev in events:
+            if ev.type in ("user_message", "assistant_message"):
+                history.append({"role": ev.role, "content": ev.content})
+
+        # Stream response chunks
+        async for chat_message in self.chat_service.process_message(
+            user_message, history
+        ):
+            await self._send_chat_response(websocket, request_id, chat_message)
+
+        # Send completion signal
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "request_id": request_id,
+                    "status": "complete",
+                    "chunk": {},
+                }
+            )
+        )
+
+    async def _handle_non_streaming_chat(
+        self,
+        websocket: WebSocket,
+        request_id: str,
+        conversation_id: str,
+        user_message: str,
+        model: str | None,
+    ):
+        """Handle non-streaming chat response."""
+        assistant_ev = await self.chat_service.chat_once(
+            conversation_id=conversation_id,
+            user_msg=user_message,
+            model=model,
+            request_id=request_id,
+        )
+
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "request_id": request_id,
+                    "status": "chunk",
+                    "chunk": {
+                        "type": "text",
+                        "data": assistant_ev.content,
+                        "metadata": {},
+                    },
+                }
+            )
+        )
+
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "request_id": request_id,
+                    "status": "complete",
+                    "chunk": {},
+                }
+            )
+        )
 
     async def _send_chat_response(
         self, websocket: WebSocket, request_id: str, chat_message

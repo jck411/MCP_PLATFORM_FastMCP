@@ -5,10 +5,12 @@ Main module for MCP client implementation.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shutil
 import sys
+from collections.abc import AsyncGenerator
 from contextlib import AsyncExitStack
 from typing import Any
 
@@ -393,6 +395,102 @@ class LLMClient:
                 error=types.ErrorData(
                     code=types.INTERNAL_ERROR,
                     message=f"LLM API error: {e!s}",
+                )
+            ) from e
+
+    async def get_streaming_response_with_tools(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+    ) -> AsyncGenerator[dict[str, Any]]:
+        """Get streaming response from LLM API with structured tool calls support."""
+        try:
+            payload = {
+                "model": self.config["model"],
+                "messages": messages,
+                "temperature": self.config.get("temperature", 0.7),
+                "max_tokens": self.config.get("max_tokens", 4096),
+                "top_p": self.config.get("top_p", 1.0),
+                "stream": True,
+            }
+
+            if tools:
+                payload["tools"] = tools
+
+            async with self.client.stream(
+                "POST", "/chat/completions", json=payload
+            ) as response:
+                # FAIL FAST: Ensure streaming response is valid
+                HTTP_OK = 200
+                if response.status_code != HTTP_OK:
+                    error_text = await response.aread()
+                    raise McpError(
+                        error=types.ErrorData(
+                            code=types.INTERNAL_ERROR,
+                            message=(
+                                f"Streaming API error {response.status_code}: "
+                                f"{error_text}"
+                            ),
+                        )
+                    )
+
+                content_type = response.headers.get("content-type", "")
+                expected_types = ["text/event-stream", "stream"]
+                if not any(t in content_type for t in expected_types):
+                    raise McpError(
+                        error=types.ErrorData(
+                            code=types.INTERNAL_ERROR,
+                            message=(
+                                f"Expected streaming response, got "
+                                f"content-type: {content_type}"
+                            ),
+                        )
+                    )
+
+                chunk_count = 0
+                async for line in response.aiter_lines():
+                    if not line.strip():
+                        continue
+
+                    if line.startswith("data: "):
+                        data = line[6:]  # Remove "data: " prefix
+
+                        if data.strip() == "[DONE]":
+                            break
+
+                        try:
+                            chunk = json.loads(data)
+                            chunk_count += 1
+                            yield chunk
+                        except json.JSONDecodeError as e:
+                            # FAIL FAST: Invalid JSON in stream
+                            raise McpError(
+                                error=types.ErrorData(
+                                    code=types.PARSE_ERROR,
+                                    message=f"Invalid JSON in stream chunk: {e}",
+                                )
+                            ) from e
+
+                # FAIL FAST: Ensure we got at least some data
+                if chunk_count == 0:
+                    raise McpError(
+                        error=types.ErrorData(
+                            code=types.INTERNAL_ERROR,
+                            message="No streaming chunks received from API",
+                        )
+                    )
+
+        except httpx.HTTPError as e:
+            logging.error(f"HTTP error during streaming: {e}")
+            raise McpError(
+                error=types.ErrorData(
+                    code=types.INTERNAL_ERROR, message=f"HTTP error: {e!s}"
+                )
+            ) from e
+        except Exception as e:
+            logging.error(f"LLM streaming API error: {e}")
+            raise McpError(
+                error=types.ErrorData(
+                    code=types.INTERNAL_ERROR,
+                    message=f"LLM streaming API error: {e!s}",
                 )
             ) from e
 

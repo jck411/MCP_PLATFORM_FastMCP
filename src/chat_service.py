@@ -134,11 +134,21 @@ class ChatService:
         user_msg: str,
         history: list[dict[str, Any]],
     ) -> AsyncGenerator[ChatMessage]:
-        """Process a user message and yield response chunks."""
+        """
+        Process a user message and yield response chunks.
+        REQUIRES streaming LLM client.
+        """
         await self._ready.wait()
 
         if not self.tool_mgr:
             raise RuntimeError("Tool manager not initialized")
+
+        # FAIL FAST: Ensure LLM client supports streaming
+        if not hasattr(self.llm_client, 'get_streaming_response_with_tools'):
+            raise RuntimeError(
+                "LLM client does not support streaming. "
+                "Use chat_once() for non-streaming responses."
+            )
 
         conv = [
             {"role": "system", "content": self._system_prompt},
@@ -148,17 +158,23 @@ class ChatService:
 
         tools_payload = self.tool_mgr.get_openai_tools()
 
-        reply = await self.llm_client.get_response_with_tools(conv, tools_payload)
-        assistant_msg = reply["message"]
+        # Initial response - stream and collect
+        assistant_msg: dict[str, Any] = {}
+        async for chunk in self._stream_llm_response(conv, tools_payload):
+            if isinstance(chunk, ChatMessage):
+                yield chunk
+            else:
+                assistant_msg = chunk
 
         # Log LLM reply if configured
-        self._log_llm_reply(reply, "Streaming initial response")
+        reply_data = {
+            "message": assistant_msg,
+            "usage": None,  # Usage not available in streaming mode
+            "model": self.llm_client.config.get("model", "")
+        }
+        self._log_llm_reply(reply_data, "Streaming initial response")
 
-        if txt := assistant_msg.get("content"):
-            yield ChatMessage(
-                "text", txt, {"finish_reason": assistant_msg.get("finish_reason")}
-            )
-
+        # Handle tool calls in a loop
         hops = 0
         while calls := assistant_msg.get("tool_calls"):
             if hops >= MAX_TOOL_HOPS:
@@ -173,6 +189,7 @@ class ChatService:
                 )
                 break
 
+            # Add assistant message to conversation
             conv.append(
                 {
                     "role": "assistant",
@@ -181,38 +198,115 @@ class ChatService:
                 }
             )
 
-            for call in calls:
-                tool_name = call["function"]["name"]
-                args = json.loads(call["function"]["arguments"] or "{}")
+            # Execute tool calls
+            await self._execute_tool_calls(conv, calls)
 
-                result = await self.tool_mgr.call_tool(tool_name, args)
-
-                # Handle structured content
-                content = self._pluck_content(result)
-
-                conv.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "content": content,
-                    }
-                )
-
-            assistant_reply = (
-                await self.llm_client.get_response_with_tools(conv, tools_payload)
-            )
-            assistant_msg = assistant_reply["message"]
+            # Get follow-up response - stream and collect
+            assistant_msg = {}
+            async for chunk in self._stream_llm_response(conv, tools_payload):
+                if isinstance(chunk, ChatMessage):
+                    yield chunk
+                else:
+                    assistant_msg = chunk
 
             # Log LLM reply if configured
+            reply_data = {
+                "message": assistant_msg,
+                "usage": None,  # Usage not available in streaming mode
+                "model": self.llm_client.config.get("model", "")
+            }
             context = f"Streaming tool follow-up (hop {hops + 1})"
-            self._log_llm_reply(assistant_reply, context)
-
-            if txt := assistant_msg.get("content"):
-                yield ChatMessage(
-                    "text", txt, {"finish_reason": assistant_msg.get("finish_reason")}
-                )
+            self._log_llm_reply(reply_data, context)
 
             hops += 1
+
+    async def _stream_llm_response(
+        self, conv: list[dict[str, Any]], tools_payload: list[dict[str, Any]]
+    ) -> AsyncGenerator[ChatMessage | dict[str, Any]]:
+        """Stream response from LLM and yield chunks to user."""
+        message_buffer = ""
+        current_tool_calls: list[dict[str, Any]] = []
+        finish_reason: str | None = None
+
+        async for chunk in self.llm_client.get_streaming_response_with_tools(
+            conv, tools_payload
+        ):
+            if "choices" not in chunk or not chunk["choices"]:
+                continue
+
+            choice = chunk["choices"][0]
+            delta = choice.get("delta", {})
+
+            # Handle content streaming
+            if content := delta.get("content"):
+                message_buffer += content
+                yield ChatMessage("text", content, {"type": "delta"})
+
+            # Handle tool calls streaming
+            if tool_calls := delta.get("tool_calls"):
+                self._accumulate_tool_calls(current_tool_calls, tool_calls)
+
+            # Handle finish reason
+            if "finish_reason" in choice:
+                finish_reason = choice["finish_reason"]
+
+        # Yield complete assistant message as final item
+        yield {
+            "content": message_buffer or None,
+            "tool_calls": current_tool_calls if current_tool_calls and any(
+                call["function"]["name"] for call in current_tool_calls
+            ) else None,
+            "finish_reason": finish_reason
+        }
+
+    def _accumulate_tool_calls(
+        self, current_tool_calls: list[dict[str, Any]], tool_calls: list[dict[str, Any]]
+    ) -> None:
+        """Accumulate streaming tool calls into the current buffer."""
+        for tool_call in tool_calls:
+            # Ensure we have enough space in the buffer
+            while len(current_tool_calls) <= tool_call.get("index", 0):
+                current_tool_calls.append({
+                    "id": "",
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""}
+                })
+
+            idx = tool_call.get("index", 0)
+            if "id" in tool_call:
+                current_tool_calls[idx]["id"] = tool_call["id"]
+            if "function" in tool_call:
+                func = tool_call["function"]
+                if "name" in func:
+                    current_tool_calls[idx]["function"]["name"] += func["name"]
+                if "arguments" in func:
+                    call_args = current_tool_calls[idx]["function"]["arguments"]
+                    current_tool_calls[idx]["function"]["arguments"] = (
+                        call_args + func["arguments"]
+                    )
+
+    async def _execute_tool_calls(
+        self, conv: list[dict[str, Any]], calls: list[dict[str, Any]]
+    ) -> None:
+        """Execute tool calls and add results to conversation."""
+        assert self.tool_mgr is not None
+
+        for call in calls:
+            tool_name = call["function"]["name"]
+            args = json.loads(call["function"]["arguments"] or "{}")
+
+            result = await self.tool_mgr.call_tool(tool_name, args)
+
+            # Handle structured content
+            content = self._pluck_content(result)
+
+            conv.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "content": content,
+                }
+            )
 
     async def _get_existing_assistant_response(
         self, conversation_id: str, request_id: str
