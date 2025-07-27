@@ -23,6 +23,7 @@ from mcp import types
 
 from src.history.chat_store import ChatEvent, ChatRepository, ToolCall, Usage
 from src.history.persistence import ConversationPersistenceService
+from src.http_resilience import ResilientHttpClient, create_http_config_from_dict
 from src.mcp_services.prompting import MCPResourcePromptService
 
 if TYPE_CHECKING:
@@ -86,15 +87,7 @@ class OpenAIOrchestrator:
         providers = llm_config.get("providers") or {}
         self.provider_cfg = providers.get(self.active_name, {})
 
-        # HTTP configuration with defaults
-        http_config = llm_config.get("http", {})
-        self.max_retries = http_config.get("max_retries", 3)
-        self.initial_retry_delay = http_config.get("initial_retry_delay", 1.0)
-        self.max_retry_delay = http_config.get("max_retry_delay", 16.0)
-        self.retry_multiplier = http_config.get("retry_multiplier", 2.0)
-        self.retry_jitter = http_config.get("retry_jitter", 0.1)
-
-        # Now you can safely read api key and base_url
+        # Extract API key and base URL
         self.api_key = self._extract_api_key()
         self.base_url = (self.provider_cfg.get("base_url") or "").rstrip("/")
 
@@ -107,26 +100,24 @@ class OpenAIOrchestrator:
         if not self.base_url:
             raise RuntimeError("Missing base_url in provider config")
 
-        # Configure HTTP client with reliability features
-        timeout = self.provider_cfg.get("timeout", http_config.get("timeout", 30.0))
-        max_keepalive = http_config.get("max_keepalive_connections", 20)
-        max_connections = http_config.get("max_connections", 100)
-        keepalive_expiry = http_config.get("keepalive_expiry", 30.0)
+        # Create HTTP resilience configuration
+        http_config = create_http_config_from_dict(llm_config)
 
-        self.http = httpx.AsyncClient(
+        # Override timeout if specified in provider config
+        if "timeout" in self.provider_cfg:
+            http_config.timeout = self.provider_cfg["timeout"]
+
+        # Configure resilient HTTP client
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "MCP-Platform/1.0",
+        }
+
+        self.http_client = ResilientHttpClient(
             base_url=self.base_url,
-            timeout=httpx.Timeout(timeout),
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-                "User-Agent": "MCP-Platform/1.0",
-            },
-            # Connection pooling for better performance
-            limits=httpx.Limits(
-                max_keepalive_connections=max_keepalive,
-                max_connections=max_connections,
-                keepalive_expiry=keepalive_expiry,
-            ),
+            headers=headers,
+            config=http_config
         )
 
     def _extract_api_key(self) -> str:
@@ -137,121 +128,6 @@ class OpenAIOrchestrator:
             os.getenv(env_key)
             or self.provider_cfg.get("api_key", "")
         )
-
-    async def _exponential_backoff_delay(self, attempt: int) -> None:
-        """Calculate and apply exponential backoff delay with jitter."""
-        if attempt == 0:
-            return
-
-        # Calculate delay: base * multiplier^(attempt-1)
-        delay = min(
-            self.initial_retry_delay * (self.retry_multiplier ** (attempt - 1)),
-            self.max_retry_delay
-        )
-
-        # Add jitter to prevent thundering herd
-        task_hash = hash(asyncio.current_task()) % 100
-        jitter = delay * self.retry_jitter * (2 * task_hash / 100 - 1)
-        delay += jitter
-
-        logger.debug(f"Retrying in {delay:.2f}s (attempt {attempt})")
-        await asyncio.sleep(delay)
-
-    def _should_retry(self, error: Exception) -> bool:
-        """Determine if an error should trigger a retry."""
-        if isinstance(error, httpx.HTTPStatusError):
-            # Retry on rate limiting and server errors
-            return error.response.status_code in (429, 500, 502, 503, 504)
-        # Retry on connection and timeout errors
-        return isinstance(error, httpx.ConnectError | httpx.TimeoutException)
-
-    async def _make_http_request_with_retry(
-        self,
-        method: str,
-        url: str,
-        **kwargs: Any,
-    ) -> httpx.Response:
-        """Make HTTP request with exponential backoff retry logic."""
-        last_error: Exception | None = None
-
-        for attempt in range(self.max_retries + 1):
-            try:
-                await self._exponential_backoff_delay(attempt)
-
-                response = await self.http.request(method, url, **kwargs)
-                response.raise_for_status()
-                return response
-
-            except Exception as e:
-                last_error = e
-
-                if attempt == self.max_retries or not self._should_retry(e):
-                    break
-
-                logger.warning(
-                    f"HTTP request failed (attempt {attempt + 1}/"
-                    f"{self.max_retries + 1}): {e}"
-                )
-
-        # Re-raise the last error
-        assert last_error is not None
-        raise last_error
-
-    async def _unified_post_request(
-        self,
-        payload: dict[str, Any],
-        stream: bool = False,
-    ) -> httpx.Response | AsyncGenerator[dict[str, Any]]:
-        """Unified POST helper for both streaming and non-streaming requests."""
-        if stream:
-            payload["stream"] = True
-
-        try:
-            if stream:
-                return self._stream_response_generator(payload)
-            return await self._make_http_request_with_retry(
-                "POST", "/chat/completions", json=payload
-            )
-        except Exception as e:
-            logger.error(f"OpenAI API request failed: {e}")
-            raise
-
-    async def _stream_response_generator(
-        self, payload: dict[str, Any]
-    ) -> AsyncGenerator[dict[str, Any]]:
-        """Generate streaming responses with retry logic."""
-        last_error: Exception | None = None
-
-        for attempt in range(self.max_retries + 1):
-            try:
-                await self._exponential_backoff_delay(attempt)
-
-                async with self.http.stream(
-                    "POST", "/chat/completions", json=payload
-                ) as response:
-                    response.raise_for_status()
-                    async for line in response.aiter_lines():
-                        if line.startswith("data: "):
-                            data = line[6:]
-                            if data.strip() == "[DONE]":
-                                return
-                            yield json.loads(data)
-                return  # Successful completion
-
-            except Exception as e:
-                last_error = e
-
-                if attempt == self.max_retries or not self._should_retry(e):
-                    break
-
-                logger.warning(
-                    f"Streaming request failed (attempt {attempt + 1}/"
-                    f"{self.max_retries + 1}): {e}"
-                )
-
-        # Re-raise the last error
-        assert last_error is not None
-        raise last_error
 
     @property
     def model(self) -> str:
@@ -361,19 +237,30 @@ class OpenAIOrchestrator:
     ) -> dict[str, Any]:
         """Make direct OpenAI API call with retry logic."""
         payload = self._build_openai_request(messages, tools)
-        response = await self._unified_post_request(payload, stream=False)
-        assert isinstance(response, httpx.Response)
-        return self._parse_openai_response(response.json())
+        response = await self.http_client.post_json("/chat/completions", payload)
+
+        # For non-streaming, we expect an httpx.Response
+        if isinstance(response, httpx.Response):
+            return self._parse_openai_response(response.json())
+
+        raise TypeError("Expected httpx.Response for non-streaming request")
 
     async def _stream_openai_api(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
     ) -> AsyncGenerator[dict[str, Any]]:
         """Stream responses from OpenAI API with retry logic."""
         payload = self._build_openai_request(messages, tools)
-        response_gen = await self._unified_post_request(payload, stream=True)
-        assert not isinstance(response_gen, httpx.Response)
-        async for chunk in response_gen:
-            yield chunk
+        response_gen = await self.http_client.post_json(
+            "/chat/completions", payload, stream=True
+        )
+
+        # For streaming, we expect an AsyncGenerator
+        if not isinstance(response_gen, httpx.Response):
+            async for chunk in response_gen:
+                yield chunk
+            return
+
+        raise TypeError("Expected AsyncGenerator for streaming request")
 
     async def _build_conversation_history(
         self, conversation_id: str
@@ -942,8 +829,8 @@ class OpenAIOrchestrator:
 
     async def cleanup(self) -> None:
         """Clean up resources by closing all connected MCP clients and HTTP client."""
-        if self.http:
-            await self.http.aclose()
+        if self.http_client:
+            await self.http_client.close()
 
         if not self.tool_mgr:
             raise RuntimeError("Tool manager not initialized")
