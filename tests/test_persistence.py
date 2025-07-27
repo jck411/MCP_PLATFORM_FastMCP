@@ -1,7 +1,7 @@
 import pytest
 
-from src.conversation.persistence import ConversationPersistenceService
 from src.history.chat_store import ChatEvent
+from src.history.persistence import ConversationPersistenceService
 
 
 class FakeRepo:

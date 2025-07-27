@@ -21,8 +21,9 @@ from typing import TYPE_CHECKING, Any
 import httpx
 from mcp import types
 
-from src.conversation.persistence import ConversationPersistenceService
 from src.history.chat_store import ChatEvent, ChatRepository, ToolCall, Usage
+from src.history.persistence import ConversationPersistenceService
+from src.mcp_services.prompting import MCPResourcePromptService
 
 if TYPE_CHECKING:
     from src.main import MCPClient
@@ -77,6 +78,8 @@ class OpenAIOrchestrator:
         self.tool_mgr: ToolSchemaManager | None = None
         self._init_lock = asyncio.Lock()
         self._ready = asyncio.Event()
+        self.mcp_prompt: MCPResourcePromptService | None = None
+        self._system_prompt: str = ""
 
         # Establish provider fields first
         self.active_name = (llm_config.get("active") or "").lower()
@@ -147,18 +150,22 @@ class OpenAIOrchestrator:
             self.tool_mgr = ToolSchemaManager(connected_clients)
             await self.tool_mgr.initialize()
 
-            # Update resource catalog to only include available resources
-            await self._update_resource_catalog_on_availability()
-            self._system_prompt = await self._make_system_prompt()
+            # Resource catalog & system prompt (MCP-only, provider-agnostic)
+            self.mcp_prompt = MCPResourcePromptService(self.tool_mgr, self.chat_conf)
+            await self.mcp_prompt.update_resource_catalog_on_availability()
+            self._system_prompt = await self.mcp_prompt.make_system_prompt()
 
             logger.info(
                 "OpenAIOrchestrator ready: %d tools, %d resources, %d prompts",
                 len(self.tool_mgr.get_mcp_tools()),
-                len(self._resource_catalog),
+                len(self.mcp_prompt.resource_catalog if self.mcp_prompt else []),
                 len(self.tool_mgr.list_available_prompts()),
             )
 
-            logger.info("Resource catalog: %s", self._resource_catalog)
+            logger.info(
+                "Resource catalog: %s",
+                (self.mcp_prompt.resource_catalog if self.mcp_prompt else []),
+            )
 
             # Configurable system prompt logging
             if self.chat_conf.get("logging", {}).get("system_prompt", True):
@@ -804,128 +811,6 @@ class OpenAIOrchestrator:
                 out.append(f"[{type(item).__name__}]")
 
         return "\n".join(out)
-
-    async def _make_system_prompt(self) -> str:
-        """Build the system prompt with actual resource contents and prompts."""
-        base = self.chat_conf["system_prompt"].rstrip()
-
-        assert self.tool_mgr is not None
-
-        # Only include resources that are actually available
-        available_resources = await self._get_available_resources()
-        if available_resources:
-            base += "\n\n**Available Resources:**"
-            for uri, content_info in available_resources.items():
-                resource_info = self.tool_mgr.get_resource_info(uri)
-                name = resource_info.resource.name if resource_info else uri
-
-                base += f"\n\n**{name}** ({uri}):"
-
-                for content in content_info:
-                    if isinstance(content, types.TextResourceContents):
-                        lines = content.text.strip().split('\n')
-                        for line in lines:
-                            base += f"\n{line}"
-                    elif isinstance(content, types.BlobResourceContents):
-                        base += f"\n[Binary content: {len(content.blob)} bytes]"
-                    else:
-                        base += f"\n[{type(content).__name__} available]"
-
-        prompt_names = self.tool_mgr.list_available_prompts()
-        if prompt_names:
-            prompt_list = []
-            for name in prompt_names:
-                pinfo = self.tool_mgr.get_prompt_info(name)
-                if pinfo:
-                    desc = pinfo.prompt.description or "No description available"
-                    prompt_list.append(f"• **{name}**: {desc}")
-
-            prompts_text = "\n".join(prompt_list)
-            base += (
-                f"\n\n**Available Prompts** (use apply_prompt method):\n"
-                f"{prompts_text}"
-            )
-
-        return base
-
-    async def _get_available_resources(
-        self,
-    ) -> dict[str, list[types.TextResourceContents | types.BlobResourceContents]]:
-        """
-        Check resource availability and return only resources that can be read
-        successfully.
-
-        This implements graceful degradation by only including working resources
-        in the system prompt, following best practices for resource management.
-        """
-        available_resources: dict[
-            str, list[types.TextResourceContents | types.BlobResourceContents]
-        ] = {}
-
-        if not self._resource_catalog or not self.tool_mgr:
-            return available_resources
-
-        for uri in self._resource_catalog:
-            try:
-                resource_result = await self.tool_mgr.read_resource(uri)
-                if resource_result.contents:
-                    # Only include resources that have actual content
-                    available_resources[uri] = resource_result.contents
-                    logger.debug(f"Resource {uri} is available and loaded")
-                else:
-                    logger.debug(f"Resource {uri} has no content, skipping")
-            except Exception as e:
-                # Log the error but don't include in system prompt
-                # This prevents the LLM from being told about broken resources
-                logger.warning(
-                    f"Resource {uri} is unavailable and will be excluded "
-                    f"from system prompt: {e}"
-                )
-                continue
-
-        if available_resources:
-            logger.info(
-                f"Including {len(available_resources)} available resources "
-                f"in system prompt"
-            )
-        else:
-            logger.info(
-                "No resources are currently available - system prompt will not "
-                "include resource section"
-            )
-
-        return available_resources
-
-    async def _update_resource_catalog_on_availability(self) -> None:
-        """
-        Update the resource catalog to reflect current availability.
-
-        This implements a circuit-breaker-like pattern where we periodically
-        check if previously failed resources have become available again.
-        """
-        if not self.tool_mgr:
-            return
-
-        # Get all registered resources from the tool manager
-        all_resource_uris = self.tool_mgr.list_available_resources()
-
-        # Filter to only include resources that are actually available
-        available_uris = []
-        for uri in all_resource_uris:
-            try:
-                resource_result = await self.tool_mgr.read_resource(uri)
-                if resource_result.contents:
-                    available_uris.append(uri)
-            except Exception:
-                # Skip unavailable resources silently
-                continue
-
-        # Update the catalog to only include working resources
-        self._resource_catalog = available_uris
-        logger.debug(
-            f"Updated resource catalog: {len(available_uris)} of "
-            f"{len(all_resource_uris)} resources are available"
-        )
 
     async def cleanup(self) -> None:
         """Clean up resources by closing all connected MCP clients and HTTP client."""
