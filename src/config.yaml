@@ -26,7 +26,7 @@ chat:
 
     # Streaming configuration
     streaming:
-      enabled: false  # Enable streaming by default (required setting)
+      enabled: true  # Enable streaming by default (required setting)
 
     # Tool execution notifications
     tool_notifications:
@@ -47,7 +47,7 @@ chat:
 
 # LLM Configuration - Just change the 'active' provider!
 llm:
-  active: "anthropic"  # Change this to: openai, groq, openrouter, anthropic, azure
+  active: "openai"  # Change this to: openai, groq, openrouter, anthropic, azure
 
   # Provider presets
   providers:

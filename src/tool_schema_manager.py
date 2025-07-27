@@ -31,7 +31,6 @@ class ToolSchemaManager:
         self._tool_registry: dict[str, ToolInfo] = {}
         self._prompt_registry: dict[str, PromptInfo] = {}
         self._resource_registry: dict[str, ResourceInfo] = {}
-        self._openai_tools: list[dict[str, Any]] = []
         self._schema_cache: dict[str, type[BaseModel]] = {}
 
     async def initialize(self) -> None:
@@ -39,7 +38,6 @@ class ToolSchemaManager:
         self._tool_registry.clear()
         self._prompt_registry.clear()
         self._resource_registry.clear()
-        self._openai_tools.clear()
         self._schema_cache.clear()
 
         for client in self.clients:
@@ -70,15 +68,13 @@ class ToolSchemaManager:
                     logger.warning(f"Tool name conflict: '{tool_name}' already exists")
                     tool_name = f"{client.name}_{tool_name}"
 
-                openai_schema = self._convert_to_openai_schema(tool)
                 validation_model = self._create_validation_model(tool)
 
                 if validation_model:
                     self._schema_cache[tool_name] = validation_model
 
-                tool_info = ToolInfo(tool, client, openai_schema)
+                tool_info = ToolInfo(tool, client)
                 self._tool_registry[tool_name] = tool_info
-                self._openai_tools.append(openai_schema)
 
             logger.info(f"Registered {len(tools)} tools from client '{client.name}'")
         except Exception as e:
@@ -154,37 +150,6 @@ class ToolSchemaManager:
         field_definitions = self._schema_to_pydantic_fields(tool.inputSchema)
         model_name = f"{tool.name}Params"
         return create_model(model_name, **field_definitions)
-
-    def _convert_to_openai_schema(self, tool: types.Tool) -> dict[str, Any]:
-        """Convert MCP Tool to OpenAI format."""
-        if not tool.inputSchema:
-            raise ValueError(f"Tool {tool.name} has no input schema")
-
-        openai_schema = {
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description or "No description provided",
-                "parameters": tool.inputSchema,
-            },
-        }
-
-        if tool.title:
-            openai_schema["function"]["title"] = tool.title
-
-        if tool.annotations:
-            openai_schema["function"]["annotations"] = tool.annotations.model_dump()
-
-        if tool.outputSchema:
-            openai_schema["function"]["output_schema"] = tool.outputSchema
-
-        openai_schema["function"]["_mcp_metadata"] = {
-            "original_tool": tool.model_dump(exclude_none=True),
-            "sdk_version": "1.12.0+",
-            "json_schema": tool.model_dump_json(),
-        }
-
-        return openai_schema
 
     def _schema_to_pydantic_fields(self, schema: dict[str, Any]) -> dict[str, Any]:
         """Convert JSON schema to Pydantic field definitions."""
@@ -292,9 +257,16 @@ class ToolSchemaManager:
                 )
             ) from e
 
-    def get_openai_tools(self) -> list[dict[str, Any]]:
-        """Get all tools in OpenAI format."""
-        return self._openai_tools.copy()
+    def get_mcp_tools(self) -> list[dict[str, Any]]:
+        """Get all tools in native MCP format (no conversion)."""
+        mcp_tools = []
+        for tool_info in self._tool_registry.values():
+            mcp_tools.append({
+                "name": tool_info.tool.name,
+                "description": tool_info.tool.description or "No description provided",
+                "inputSchema": tool_info.tool.inputSchema,
+            })
+        return mcp_tools
 
     def get_tool_info(self, tool_name: str) -> ToolInfo:
         """Get detailed information about a specific tool."""
@@ -364,12 +336,9 @@ class ToolSchemaManager:
 class ToolInfo:
     """Information about a registered tool."""
 
-    def __init__(
-        self, tool: types.Tool, client: MCPClient, openai_schema: dict[str, Any]
-    ):
+    def __init__(self, tool: types.Tool, client: MCPClient):
         self.tool = tool
         self.client = client
-        self.openai_schema = openai_schema
 
 
 class PromptInfo:

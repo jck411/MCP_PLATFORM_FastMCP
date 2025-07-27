@@ -14,12 +14,11 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.chat_service import ChatService
+from src.openai_orchestrator import OpenAIOrchestrator
 from src.history.chat_store import ChatRepository
 
 # TYPE_CHECKING imports to avoid circular imports
 if TYPE_CHECKING:
-    from src.llm import LLMClient
     from src.main import MCPClient
 
 logger = logging.getLogger(__name__)
@@ -34,17 +33,19 @@ class WebSocketServer:
     - Message parsing and routing
     - Response streaming
 
-    All business logic is delegated to ChatService.
+    All business logic is delegated to OpenAIOrchestrator.
     """
 
     def __init__(
         self,
         clients: list["MCPClient"],
-        llm_client: "LLMClient",
+        llm_config: dict[str, Any],
         config: dict[str, Any],
         repo: ChatRepository,
     ):
-        self.chat_service = ChatService(clients, llm_client, config, repo=repo)
+        self.chat_service = OpenAIOrchestrator(
+            clients, llm_config, config, repo
+        )
         self.repo = repo
         self.config = config
         self.app = self._create_app()
@@ -142,7 +143,6 @@ class WebSocketServer:
 
         payload = message_data.get("payload", {})
         user_message = payload.get("text", "")
-        model = payload.get("model")  # optional
 
         # Check streaming configuration - FAIL FAST approach
         service_config = self.config.get("chat", {}).get("service", {})
@@ -202,7 +202,7 @@ class WebSocketServer:
             else:
                 # Non-streaming mode: single final assistant message
                 await self._handle_non_streaming_chat(
-                    websocket, request_id, conversation_id, user_message, model
+                    websocket, request_id, conversation_id, user_message
                 )
 
         except Exception as e:
@@ -224,19 +224,11 @@ class WebSocketServer:
         conversation_id: str,
         user_message: str,
     ):
-        """Handle streaming chat response."""
-        # Get chat history for this conversation
-        events = await self.repo.last_n_tokens(conversation_id, 4000)
-
-        # Convert to OpenAI-style history
-        history = []
-        for ev in events:
-            if ev.type in ("user_message", "assistant_message"):
-                history.append({"role": ev.role, "content": ev.content})
-
-        # Stream response chunks
+        """Handle streaming chat response with unified persistence."""
+        # Use the unified streaming approach - no manual persistence needed
+        # The chat service now handles all persistence internally
         async for chat_message in self.chat_service.process_message(
-            user_message, history
+            conversation_id, user_message, request_id
         ):
             await self._send_chat_response(websocket, request_id, chat_message)
 
@@ -257,36 +249,23 @@ class WebSocketServer:
         request_id: str,
         conversation_id: str,
         user_message: str,
-        model: str | None,
     ):
-        """Handle non-streaming chat response."""
-        assistant_ev = await self.chat_service.chat_once(
-            conversation_id=conversation_id,
-            user_msg=user_message,
-            model=model,
-            request_id=request_id,
-        )
+        """Handle non-streaming chat response by collecting streaming chunks."""
+        # Collect all chunks from the streaming method
+        full_content = ""
+        async for chat_message in self.chat_service.process_message(
+            conversation_id, user_message, request_id
+        ):
+            if chat_message.type == "text":
+                full_content += chat_message.content
 
-        await websocket.send_text(
-            json.dumps(
-                {
-                    "request_id": request_id,
-                    "status": "chunk",
-                    "chunk": {
-                        "type": "text",
-                        "data": assistant_ev.content,
-                        "metadata": {},
-                    },
-                }
-            )
-        )
-
+        # Send the complete response
         await websocket.send_text(
             json.dumps(
                 {
                     "request_id": request_id,
                     "status": "complete",
-                    "chunk": {},
+                    "response": full_content,
                 }
             )
         )
@@ -398,7 +377,7 @@ class WebSocketServer:
 
 async def run_websocket_server(
     clients: list["MCPClient"],
-    llm_client: "LLMClient",
+    llm_config: dict[str, Any],
     config: dict[str, Any],
     repo: ChatRepository,
 ) -> None:
@@ -408,5 +387,5 @@ async def run_websocket_server(
     This function maintains the same interface as before but now uses
     the clean separation between communication and business logic.
     """
-    server = WebSocketServer(clients, llm_client, config, repo)
+    server = WebSocketServer(clients, llm_config, config, repo)
     await server.start_server()

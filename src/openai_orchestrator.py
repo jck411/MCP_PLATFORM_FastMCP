@@ -1,11 +1,12 @@
 """
-Chat Service for MCP Platform
+OpenAI Orchestrator for MCP Platform
 
-This module handles the business logic for chat sessions, including:
+This module handles the business logic for chat sessions with integrated
+OpenAI API compatibility:
 - Conversation management with simple default prompts
 - Tool orchestration
 - MCP client coordination
-- LLM interactions
+- Direct OpenAI API interactions (no adapter layer)
 """
 
 from __future__ import annotations
@@ -13,15 +14,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any
 
+import httpx
 from mcp import types
 
-from src.history.chat_store import ChatEvent, ChatRepository, Usage
+from src.conversation.persistence import ConversationPersistenceService
+from src.history.chat_store import ChatEvent, ChatRepository, ToolCall, Usage
 
 if TYPE_CHECKING:
-    from src.llm import LLMClient
     from src.main import MCPClient
     from src.tool_schema_manager import ToolSchemaManager
 else:
@@ -47,35 +50,70 @@ class ChatMessage:
         self.metadata = self.meta
 
 
-class ChatService:
+class OpenAIOrchestrator:
     """
-    Conversation orchestrator - recommended pattern
+    Conversation orchestrator with integrated OpenAI API handling.
     1. Takes your message
     2. Figures out what tools might be needed
-    3. Asks the AI to respond (and use tools if needed)
+    3. Asks the AI to respond (and use tools if needed) via OpenAI API
     4. Sends you back the response
     """
 
     def __init__(
         self,
         clients: list[MCPClient],
-        llm_client: LLMClient,
+        llm_config: dict[str, Any],
         config: dict[str, Any],
         repo: ChatRepository,
         ctx_window: int = 4000,
     ):
         self.clients = clients
-        self.llm_client = llm_client
+        self.llm_config = llm_config
         self.config = config
         self.repo = repo
+        self.persist = ConversationPersistenceService(repo)
         self.ctx_window = ctx_window
         self.chat_conf = config.get("chat", {}).get("service", {})
         self.tool_mgr: ToolSchemaManager | None = None
         self._init_lock = asyncio.Lock()
         self._ready = asyncio.Event()
 
+        # Establish provider fields first
+        self.active_name = (llm_config.get("active") or "").lower()
+        providers = llm_config.get("providers") or {}
+        self.provider_cfg = providers.get(self.active_name, {})
+
+        # Now you can safely read api key and base_url
+        self.api_key = self._extract_api_key()
+        self.base_url = (self.provider_cfg.get("base_url") or "").rstrip("/")
+
+        # Validate required configuration
+        if not self.api_key:
+            raise RuntimeError(
+                f"Missing API key: set {self.active_name.upper()}_API_KEY or "
+                f"providers['{self.active_name}']['api_key']"
+            )
+        if not self.base_url:
+            raise RuntimeError("Missing base_url in provider config")
+
+        self.http = httpx.AsyncClient(base_url=self.base_url, timeout=30.0)
+
+    def _extract_api_key(self) -> str:
+        """Extract API key from env or provider config; raise if absent."""
+        provider_name = (self.llm_config.get("active") or "").upper()
+        env_key = f"{provider_name}_API_KEY"
+        return (
+            os.getenv(env_key)
+            or self.provider_cfg.get("api_key", "")
+        )
+
+    @property
+    def model(self) -> str:
+        """Get the model name from the current configuration."""
+        return self.provider_cfg.get("model", "")
+
     async def initialize(self) -> None:
-        """Initialize the chat service and all MCP clients."""
+        """Initialize the orchestrator and all MCP clients."""
         async with self._init_lock:
             if self._ready.is_set():
                 return
@@ -114,8 +152,8 @@ class ChatService:
             self._system_prompt = await self._make_system_prompt()
 
             logger.info(
-                "ChatService ready: %d tools, %d resources, %d prompts",
-                len(self.tool_mgr.get_openai_tools()),
+                "OpenAIOrchestrator ready: %d tools, %d resources, %d prompts",
+                len(self.tool_mgr.get_mcp_tools()),
                 len(self._resource_catalog),
                 len(self.tool_mgr.list_available_prompts()),
             )
@@ -130,40 +168,186 @@ class ChatService:
 
             self._ready.set()
 
+    def _build_openai_request(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
+        """Build OpenAI API request payload."""
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.provider_cfg.get("temperature", 0.1),
+            "max_tokens": self.provider_cfg.get("max_tokens", 2048),
+            "top_p": self.provider_cfg.get("top_p", 1.0),
+        }
+
+        if tools:
+            # Convert MCP tools to OpenAI format
+            openai_tools = []
+            for tool in tools:
+                openai_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool["description"],
+                        "parameters": tool["inputSchema"],
+                    }
+                })
+            payload["tools"] = openai_tools
+
+        return payload
+
+    def _parse_openai_response(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Parse OpenAI API response."""
+        choice = data["choices"][0]
+        return {
+            "message": choice["message"],
+            "finish_reason": choice.get("finish_reason"),
+            "usage": data.get("usage"),
+            "model": data.get("model", self.model),
+        }
+
+    async def _call_openai_api(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
+        """Make direct OpenAI API call."""
+        payload = self._build_openai_request(messages, tools)
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+
+        response = await self.http.post(
+            "/chat/completions",
+            headers=headers,
+            json=payload
+        )
+        response.raise_for_status()
+        return self._parse_openai_response(response.json())
+
+    async def _stream_openai_api(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+    ) -> AsyncGenerator[dict[str, Any]]:
+        """Stream responses from OpenAI API."""
+        payload = self._build_openai_request(messages, tools)
+        payload["stream"] = True
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+
+        async with self.http.stream(
+            "POST", "/chat/completions", headers=headers, json=payload
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if line.startswith("data: "):
+                    data = line[6:]
+                    if data.strip() == "[DONE]":
+                        break
+                    yield json.loads(data)
+
+    async def _build_conversation_history(
+        self, conversation_id: str
+    ) -> list[dict[str, Any]]:
+        """Build conversation history including tool calls and results."""
+        events = await self.repo.last_n_tokens(conversation_id, self.ctx_window)
+        conv: list[dict[str, Any]] = [
+            {"role": "system", "content": self._system_prompt},
+        ]
+
+        for ev in events:
+            if ev.type in ("user_message", "assistant_message", "system_update"):
+                conv.append({"role": ev.role, "content": ev.content})
+            elif ev.type == "tool_call" and ev.tool_calls:
+                # Add assistant message with tool calls
+                tool_calls = []
+                for tc in ev.tool_calls:
+                    tool_calls.append({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments)
+                        }
+                    })
+                conv.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": tool_calls
+                })
+            elif ev.type == "tool_result":
+                # Add tool result message
+                tool_call_id = ev.extra.get("tool_call_id")
+                if tool_call_id:
+                    conv.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": ev.content or ""
+                    })
+
+        return conv
+
     async def process_message(
         self,
+        conversation_id: str,
         user_msg: str,
-        history: list[dict[str, Any]],
+        request_id: str,
     ) -> AsyncGenerator[ChatMessage]:
         """
-        Process a user message and yield response chunks.
-        REQUIRES streaming LLM client.
+        Process a user message with streaming response.
+        Follows same persistence pattern as chat_once for consistency.
         """
         await self._ready.wait()
 
         if not self.tool_mgr:
             raise RuntimeError("Tool manager not initialized")
 
-        # FAIL FAST: Ensure LLM client supports streaming
-        if not hasattr(self.llm_client, 'get_streaming_response_with_tools'):
-            raise RuntimeError(
-                "LLM client does not support streaming. "
-                "Use chat_once() for non-streaming responses."
+        # Check for existing response to prevent double-processing
+        existing_response = await self.persist.get_existing_assistant_response(
+            conversation_id, request_id
+        )
+        if existing_response:
+            logger.info(f"Returning cached response for request_id: {request_id}")
+            cached_text = self.persist.get_cached_text(existing_response)
+            if cached_text:
+                yield ChatMessage("text", cached_text, {"type": "cached"})
+            return
+
+        # 1) Persist user message and check if we should continue
+        should_continue = await self.persist.ensure_user_message_persisted(
+            conversation_id, user_msg, request_id
+        )
+        if not should_continue:
+            # User message existed and assistant response found
+            existing_response = await self.persist.get_existing_assistant_response(
+                conversation_id, request_id
             )
+            if existing_response:
+                cached_text = self.persist.get_cached_text(existing_response)
+                if cached_text:
+                    yield ChatMessage("text", cached_text, {"type": "cached"})
+                return
 
-        conv = [
-            {"role": "system", "content": self._system_prompt},
-            *history,
-            {"role": "user", "content": user_msg},
-        ]
+        # 2) Build conversation history from persistent store
+        conv = await self._build_conversation_history(conversation_id)
 
-        tools_payload = self.tool_mgr.get_openai_tools()
+        # 3) Generate streaming response with tool handling
+        async for msg in self._process_streaming_with_tools(
+            conv, conversation_id, request_id
+        ):
+            yield msg
+
+    async def _process_streaming_with_tools(
+        self, conv: list[dict[str, Any]], conversation_id: str, request_id: str
+    ) -> AsyncGenerator[ChatMessage]:
+        """Handle the streaming response generation and tool execution."""
+        assert self.tool_mgr is not None
+
+        tools_payload = self.tool_mgr.get_mcp_tools()
+        full_assistant_content = ""
 
         # Initial response - stream and collect
         assistant_msg: dict[str, Any] = {}
         async for chunk in self._stream_llm_response(conv, tools_payload):
             if isinstance(chunk, ChatMessage):
                 yield chunk
+                # Collect content for final persistence
+                if chunk.type == "text":
+                    full_assistant_content += chunk.content
             else:
                 assistant_msg = chunk
 
@@ -171,7 +355,7 @@ class ChatService:
         reply_data = {
             "message": assistant_msg,
             "usage": None,  # Usage not available in streaming mode
-            "model": self.llm_client.model
+            "model": self.model
         }
         self._log_llm_reply(reply_data, "Streaming initial response")
 
@@ -182,12 +366,14 @@ class ChatService:
                 logger.warning(
                     f"Maximum tool hops ({MAX_TOOL_HOPS}) reached, stopping recursion"
                 )
-                yield ChatMessage(
-                    "text",
+                error_msg = (
                     f"⚠️ Reached maximum tool call limit ({MAX_TOOL_HOPS}). "
-                    "Stopping to prevent infinite recursion.",
-                    {"finish_reason": "tool_limit_reached"},
+                    "Stopping to prevent infinite recursion."
                 )
+                yield ChatMessage(
+                    "text", error_msg, {"finish_reason": "tool_limit_reached"}
+                )
+                full_assistant_content += error_msg
                 break
 
             # Add assistant message to conversation
@@ -200,13 +386,16 @@ class ChatService:
             )
 
             # Execute tool calls
-            await self._execute_tool_calls(conv, calls)
+            await self._execute_tool_calls(conv, calls, conversation_id, request_id)
 
             # Get follow-up response - stream and collect
             assistant_msg = {}
             async for chunk in self._stream_llm_response(conv, tools_payload):
                 if isinstance(chunk, ChatMessage):
                     yield chunk
+                    # Collect content for final persistence
+                    if chunk.type == "text":
+                        full_assistant_content += chunk.content
                 else:
                     assistant_msg = chunk
 
@@ -214,12 +403,17 @@ class ChatService:
             reply_data = {
                 "message": assistant_msg,
                 "usage": None,  # Usage not available in streaming mode
-                "model": self.llm_client.model
+                "model": self.model
             }
             context = f"Streaming tool follow-up (hop {hops + 1})"
             self._log_llm_reply(reply_data, context)
 
             hops += 1
+
+        # 4) Persist final assistant message
+        await self.persist.persist_final_assistant_message(
+            conversation_id, full_assistant_content, request_id
+        )
 
     async def _stream_llm_response(
         self, conv: list[dict[str, Any]], tools_payload: list[dict[str, Any]]
@@ -229,9 +423,7 @@ class ChatService:
         current_tool_calls: list[dict[str, Any]] = []
         finish_reason: str | None = None
 
-        async for chunk in self.llm_client.get_streaming_response_with_tools(
-            conv, tools_payload
-        ):
+        async for chunk in self._stream_openai_api(conv, tools_payload):
             if "choices" not in chunk or not chunk["choices"]:
                 continue
 
@@ -245,6 +437,7 @@ class ChatService:
 
             # Handle tool calls streaming
             if tool_calls := delta.get("tool_calls"):
+                logger.info(f"Received tool call delta: {tool_calls}")
                 self._accumulate_tool_calls(current_tool_calls, tool_calls)
 
             # Handle finish reason
@@ -252,13 +445,27 @@ class ChatService:
                 finish_reason = choice["finish_reason"]
 
         # Yield complete assistant message as final item
-        yield {
+        assistant_message = {
             "content": message_buffer or None,
             "tool_calls": current_tool_calls if current_tool_calls and any(
                 call["function"]["name"] for call in current_tool_calls
             ) else None,
             "finish_reason": finish_reason
         }
+
+        # Debug logging for tool calls
+        if assistant_message.get("tool_calls"):
+            logger.info(f"Tool calls detected: {len(assistant_message['tool_calls'])}")
+            for i, call in enumerate(assistant_message['tool_calls']):
+                func_name = call['function']['name']
+                func_args = call['function']['arguments']
+                logger.info(f"  Tool {i+1}: {func_name} with args: {func_args}")
+        else:
+            logger.info("No tool calls detected in response")
+            logger.info(f"current_tool_calls buffer: {current_tool_calls}")
+            logger.info(f"finish_reason: {finish_reason}")
+
+        yield assistant_message
 
     def _accumulate_tool_calls(
         self, current_tool_calls: list[dict[str, Any]], tool_calls: list[dict[str, Any]]
@@ -287,20 +494,66 @@ class ChatService:
                     )
 
     async def _execute_tool_calls(
-        self, conv: list[dict[str, Any]], calls: list[dict[str, Any]]
+        self,
+        conv: list[dict[str, Any]],
+        calls: list[dict[str, Any]],
+        conversation_id: str,
+        request_id: str
     ) -> None:
-        """Execute tool calls and add results to conversation."""
+        """Execute tool calls and add results to conversation and history."""
         assert self.tool_mgr is not None
+
+        logger.info(f"Executing {len(calls)} tool calls")
 
         for call in calls:
             tool_name = call["function"]["name"]
             args = json.loads(call["function"]["arguments"] or "{}")
 
+            # 1. Persist the tool call event
+            tool_call_event = ChatEvent(
+                conversation_id=conversation_id,
+                type="tool_call",
+                role="assistant",  # Tool calls are initiated by assistant
+                tool_calls=[ToolCall(
+                    id=call["id"],
+                    name=tool_name,
+                    arguments=args
+                )],
+                extra={
+                    "user_request_id": request_id,
+                    "tool_call_id": call["id"]
+                }
+            )
+            tool_call_event.compute_and_cache_tokens()
+            await self.repo.add_event(tool_call_event)
+
+            logger.info(f"Calling tool '{tool_name}' with args: {args}")
+
+            # 2. Execute the tool
             result = await self.tool_mgr.call_tool(tool_name, args)
 
             # Handle structured content
             content = self._pluck_content(result)
 
+            # 3. Persist the tool result event
+            tool_result_event = ChatEvent(
+                conversation_id=conversation_id,
+                type="tool_result",
+                role="tool",
+                content=content,
+                extra={
+                    "user_request_id": request_id,
+                    "tool_call_id": call["id"],
+                    "tool_name": tool_name
+                },
+                raw=result  # Keep full result for debugging
+            )
+            tool_result_event.compute_and_cache_tokens()
+            await self.repo.add_event(tool_result_event)
+
+            logger.info(f"Tool '{tool_name}' returned: {content[:100]}...")
+
+            # 4. Add to conversation for immediate LLM context
             conv.append(
                 {
                     "role": "tool",
@@ -309,26 +562,11 @@ class ChatService:
                 }
             )
 
-    async def _get_existing_assistant_response(
-        self, conversation_id: str, request_id: str
-    ) -> ChatEvent | None:
-        """Get existing assistant response for a request_id if it exists."""
-        existing_assistant_id = await self.repo.get_last_assistant_reply_id(
-            conversation_id, request_id
-        )
-        if existing_assistant_id:
-            events = await self.repo.get_events(conversation_id)
-            for event in events:
-                if event.id == existing_assistant_id:
-                    return event
-        return None
-
     async def chat_once(
         self,
         conversation_id: str,
         user_msg: str,
         request_id: str,
-        model: str | None = None,
     ) -> ChatEvent:
         """Non-streaming: persist user msg first, call LLM once, persist assistant."""
         await self._ready.wait()
@@ -337,7 +575,7 @@ class ChatService:
             raise RuntimeError("Tool manager not initialized")
 
         # Check for existing response to prevent double-billing
-        existing_response = await self._get_existing_assistant_response(
+        existing_response = await self.persist.get_existing_assistant_response(
             conversation_id, request_id
         )
         if existing_response:
@@ -347,29 +585,19 @@ class ChatService:
             return existing_response
 
         # 1) persist user message FIRST with idempotency check
-        user_ev = ChatEvent(
-            conversation_id=conversation_id,
-            type="user_message",
-            role="user",
-            content=user_msg,
-            extra={"request_id": request_id},
+        should_continue = await self.persist.ensure_user_message_persisted(
+            conversation_id, user_msg, request_id
         )
-        # Ensure token count is computed
-        user_ev.compute_and_cache_tokens()
-        was_added = await self.repo.add_event(user_ev)
-
-        if not was_added:
-            # User message already exists, check for assistant response again
-            existing_response = await self._get_existing_assistant_response(
+        if not should_continue:
+            existing_response = await self.persist.get_existing_assistant_response(
                 conversation_id, request_id
             )
             if existing_response:
                 logger.info(
-                    "Returning existing response for duplicate "
-                    f"request_id: {request_id}"
+                    "Returning existing response for duplicate request_id: %s",
+                    request_id
                 )
                 return existing_response
-            # No assistant response yet, continue with LLM call
 
         # 2) build canonical history from repo
         events = await self.repo.last_n_tokens(conversation_id, self.ctx_window)
@@ -426,13 +654,13 @@ class ChatService:
         if not self.tool_mgr:
             raise RuntimeError("Tool manager not initialized")
 
-        tools_payload = self.tool_mgr.get_openai_tools()
+        tools_payload = self.tool_mgr.get_mcp_tools()
 
         assistant_full_text = ""
         total_usage = Usage()
         model = ""
 
-        reply = await self.llm_client.get_response_with_tools(conv, tools_payload)
+        reply = await self._call_openai_api(conv, tools_payload)
         assistant_msg = reply["message"]
 
         # Log LLM reply if configured
@@ -486,7 +714,7 @@ class ChatService:
                     }
                 )
 
-            reply = await self.llm_client.get_response_with_tools(conv, tools_payload)
+            reply = await self._call_openai_api(conv, tools_payload)
             assistant_msg = reply["message"]
 
             # Log LLM reply if configured
@@ -700,7 +928,10 @@ class ChatService:
         )
 
     async def cleanup(self) -> None:
-        """Clean up resources by closing all connected MCP clients."""
+        """Clean up resources by closing all connected MCP clients and HTTP client."""
+        if self.http:
+            await self.http.aclose()
+
         if not self.tool_mgr:
             raise RuntimeError("Tool manager not initialized")
 
