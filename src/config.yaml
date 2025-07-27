@@ -49,6 +49,18 @@ chat:
 llm:
   active: "openai"  # Change this to: openai, groq, openrouter, anthropic, azure
 
+  # HTTP client configuration
+  http:
+    timeout: 30.0                    # Request timeout in seconds
+    max_retries: 3                   # Maximum number of retry attempts
+    initial_retry_delay: 1.0         # Initial delay for exponential backoff (seconds)
+    max_retry_delay: 16.0            # Maximum delay for exponential backoff (seconds)
+    retry_multiplier: 2.0            # Multiplier for exponential backoff
+    retry_jitter: 0.1                # Jitter factor to prevent thundering herd
+    max_keepalive_connections: 20    # Maximum keep-alive connections
+    max_connections: 100             # Maximum total connections
+    keepalive_expiry: 30.0           # Keep-alive connection expiry (seconds)
+
   # Provider presets
   providers:
     openai:
