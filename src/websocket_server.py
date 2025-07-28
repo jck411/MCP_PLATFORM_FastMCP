@@ -305,25 +305,61 @@ class WebSocketServer:
         conversation_id: str,
         user_message: str,
     ):
-        """Handle non-streaming chat response by collecting streaming chunks."""
-        # Collect all chunks from the streaming method
-        full_content = ""
-        async for chat_message in self.chat_service.process_message(
-            conversation_id, user_message, request_id
-        ):
-            if chat_message.type == "text":
-                full_content += chat_message.content
-
-        # Send the complete response
-        await websocket.send_text(
-            json.dumps(
-                {
-                    "request_id": request_id,
-                    "status": "complete",
-                    "response": full_content,
-                }
+        """Handle non-streaming chat response using chat_once for true non-streaming."""
+        try:
+            # Use chat_once for true non-streaming (no streaming API calls)
+            chat_event = await self.chat_service.chat_once(
+                conversation_id, user_message, request_id
             )
-        )
+
+            # Send the complete response
+            if chat_event.content:
+                provider_info = self._get_provider_info()
+                metadata = {
+                    "provider_info": provider_info,
+                    "non_streaming": True,
+                    "usage": (
+                        chat_event.usage.model_dump()
+                        if chat_event.usage else None
+                    ),
+                    "model": chat_event.model,
+                    "provider": chat_event.provider
+                }
+
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "request_id": request_id,
+                            "status": "chunk",
+                            "chunk": {
+                                "type": "text",
+                                "data": chat_event.content,
+                                "metadata": metadata,
+                            },
+                        }
+                    )
+                )
+
+            # Send completion signal
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "status": "complete",
+                    }
+                )
+            )
+        except Exception as e:
+            logger.error(f"Error in non-streaming chat: {e}")
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "status": "error",
+                        "error": str(e),
+                    }
+                )
+            )
 
     async def _send_chat_response(
         self, websocket: WebSocket, request_id: str, chat_message
