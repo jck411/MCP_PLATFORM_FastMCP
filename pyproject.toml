@@ -23,7 +23,6 @@ dependencies = [
     "starlette>=0.34.0",
     "mcp-logger-utils>=0.2.1",
     "openpyxl>=3.1.2", # For Excel file support
-    "tiktoken>=0.7.0", # For accurate token counting
 ]
 
 [project.scripts]

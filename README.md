@@ -107,11 +107,11 @@ uv sync --upgrade
 # Test server file
 uv run python Servers/demo_server.py
 
-# Debug with tokens
-DEBUG_TOKENS=1 uv run python src/main.py
+# Debug with detailed logging
+DEBUG_VERBOSE=1 uv run python src/main.py
 
-# Monitor token usage
-cat events.jsonl | jq '.usage'
+# Monitor conversation history
+cat events.jsonl | jq '.type'
 ```
 
 ## 🔄 Streaming Modes
@@ -142,14 +142,14 @@ chat:
 - `src/servers_config.json` - Enable/disable MCP servers
 - `src/config.yaml` - LLM provider and streaming settings
 - `Servers/` - Your MCP server implementations
-- `events.jsonl` - Chat history and token usage
+- `events.jsonl` - Chat history and usage tracking
 
 ## ✅ Features
 
 - **Full MCP Protocol**: Tools, prompts, resources
 - **Multi-Server**: Connect multiple MCP servers simultaneously
 - **Real-time**: WebSocket communication with streaming support
-- **Token Tracking**: Accurate cost monitoring with tiktoken
+- **Usage Tracking**: Accurate cost monitoring and conversation analytics
 - **Type Safety**: Pydantic validation throughout
 - **Conflict Resolution**: Automatic handling of name/URI conflicts
 - **Schema Conversion**: MCP to OpenAI format for LLM integration

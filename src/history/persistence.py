@@ -57,7 +57,6 @@ class ConversationPersistenceService:
             content=user_msg,
             extra={"request_id": request_id},
         )
-        user_ev.compute_and_cache_tokens()
         was_added = await self.repo.add_event(user_ev)
 
         if not was_added:
@@ -84,7 +83,6 @@ class ConversationPersistenceService:
             content=content,
             extra={"user_request_id": request_id},
         )
-        assistant_ev.compute_and_cache_tokens()
         await self.repo.add_event(assistant_ev)
 
     @staticmethod

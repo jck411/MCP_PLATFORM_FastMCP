@@ -14,8 +14,8 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.openai_orchestrator import OpenAIOrchestrator
 from src.history.chat_store import ChatRepository
+from src.openai_orchestrator import OpenAIOrchestrator
 
 # TYPE_CHECKING imports to avoid circular imports
 if TYPE_CHECKING:
@@ -283,7 +283,7 @@ class WebSocketServer:
         # Convert chat service message to frontend format
         if chat_message.type == "text":
             # Only send text messages that aren't tool results
-            if not chat_message.metadata.get("tool_result"):
+            if not chat_message.meta.get("tool_result"):
                 await websocket.send_text(
                     json.dumps(
                         {
@@ -292,7 +292,7 @@ class WebSocketServer:
                             "chunk": {
                                 "type": "text",
                                 "data": chat_message.content,
-                                "metadata": chat_message.metadata,
+                                "metadata": chat_message.meta,
                             },
                         }
                     )
@@ -307,7 +307,7 @@ class WebSocketServer:
                         "chunk": {
                             "type": "tool_execution",
                             "data": chat_message.content,
-                            "metadata": chat_message.metadata,
+                            "metadata": chat_message.meta,
                         },
                     }
                 )
@@ -321,7 +321,7 @@ class WebSocketServer:
                         "status": "error",
                         "chunk": {
                             "error": chat_message.content,
-                            "metadata": chat_message.metadata,
+                            "metadata": chat_message.meta,
                         },
                     }
                 )

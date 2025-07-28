@@ -28,7 +28,7 @@ src/
 ├── main.py              # Main MCP client application
 ├── chat_service.py      # Chat orchestration and session management
 ├── config.py           # Configuration management
-├── tool_schema_manager.py # Tool schema validation and conversion
+├── schema_manager.py    # MCP schema management and validation
 ├── websocket_server.py  # WebSocket communication layer
 └── servers_config.json  # MCP server configurations
 
@@ -48,9 +48,9 @@ Servers/
 - Handles server lifecycle management
 - Manages tool discovery and execution
 
-#### Tool Schema Management (`tool_schema_manager.py`)
-- Converts MCP tool schemas to OpenAI format
-- Validates tool parameters using Pydantic
+#### Schema Management (`schema_manager.py`)
+- Manages MCP schemas for tools, prompts, and resources
+- Validates parameters using Pydantic
 - Manages tools, prompts, and resources across multiple servers
 - Provides error handling with proper MCP error codes
 

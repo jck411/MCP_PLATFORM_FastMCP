@@ -18,7 +18,7 @@ class MCPResourcePromptService:
       - Building the final system prompt by embedding resources and prompts
 
     Dependencies:
-      - ToolSchemaManager-like object with:
+      - SchemaManager-like object with:
           list_available_resources() -> list[str]
           read_resource(uri) -> object with .contents
           get_resource_info(uri) -> object with .resource.name (optional)

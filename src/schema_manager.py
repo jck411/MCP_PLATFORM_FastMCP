@@ -21,13 +21,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class ToolSchemaManager:
+class SchemaManager:
     """
-    Manages tool schemas and provides SDK-native conversion utilities.
+    Manages MCP schemas and provides SDK-native conversion utilities.
     """
 
     def __init__(self, clients: list[MCPClient]) -> None:
-        """Initialize the tool schema manager with MCP clients."""
+        """Initialize the schema manager with MCP clients."""
         self.clients = clients
         self._tool_registry: dict[str, ToolInfo] = {}
         self._prompt_registry: dict[str, PromptInfo] = {}

@@ -28,9 +28,8 @@ from src.mcp_services.prompting import MCPResourcePromptService
 
 if TYPE_CHECKING:
     from src.main import MCPClient
-    from src.tool_schema_manager import ToolSchemaManager
-else:
-    from src.tool_schema_manager import ToolSchemaManager
+
+from src.schema_manager import SchemaManager
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +47,7 @@ class ChatMessage:
     ):
         self.type = mtype
         self.content = content
-        self.meta = meta or {}
-        self.metadata = self.meta
+        self.meta = meta if meta is not None else {}
 
 
 class OpenAIOrchestrator:
@@ -67,16 +65,16 @@ class OpenAIOrchestrator:
         llm_config: dict[str, Any],
         config: dict[str, Any],
         repo: ChatRepository,
-        ctx_window: int = 4000,
+        max_history_messages: int = 50,
     ):
         self.clients = clients
         self.llm_config = llm_config
         self.config = config
         self.repo = repo
         self.persist = ConversationPersistenceService(repo)
-        self.ctx_window = ctx_window
+        self.max_history_messages = max_history_messages
         self.chat_conf = config.get("chat", {}).get("service", {})
-        self.tool_mgr: ToolSchemaManager | None = None
+        self.tool_mgr: SchemaManager | None = None
         self._init_lock = asyncio.Lock()
         self._ready = asyncio.Event()
         self.mcp_prompt: MCPResourcePromptService | None = None
@@ -166,7 +164,7 @@ class OpenAIOrchestrator:
                 )
 
             # Use connected clients for tool management (empty list is acceptable)
-            self.tool_mgr = ToolSchemaManager(connected_clients)
+            self.tool_mgr = SchemaManager(connected_clients)
             await self.tool_mgr.initialize()
 
             # Resource catalog & system prompt (MCP-only, provider-agnostic)
@@ -266,7 +264,7 @@ class OpenAIOrchestrator:
         self, conversation_id: str
     ) -> list[dict[str, Any]]:
         """Build conversation history including tool calls and results."""
-        events = await self.repo.last_n_tokens(conversation_id, self.ctx_window)
+        events = await self.repo.get_events(conversation_id, self.max_history_messages)
         conv: list[dict[str, Any]] = [
             {"role": "system", "content": self._system_prompt},
         ]
@@ -546,7 +544,6 @@ class OpenAIOrchestrator:
                     "tool_call_id": call["id"]
                 }
             )
-            tool_call_event.compute_and_cache_tokens()
             await self.repo.add_event(tool_call_event)
 
             logger.info(f"Calling tool '{tool_name}' with args: {args}")
@@ -567,10 +564,8 @@ class OpenAIOrchestrator:
                     "user_request_id": request_id,
                     "tool_call_id": call["id"],
                     "tool_name": tool_name
-                },
-                raw=result  # Keep full result for debugging
+                }
             )
-            tool_result_event.compute_and_cache_tokens()
             await self.repo.add_event(tool_result_event)
 
             logger.info(f"Tool '{tool_name}' returned: {content[:100]}...")
@@ -622,7 +617,7 @@ class OpenAIOrchestrator:
                 return existing_response
 
         # 2) build canonical history from repo
-        events = await self.repo.last_n_tokens(conversation_id, self.ctx_window)
+        events = await self.repo.get_events(conversation_id, self.max_history_messages)
 
         # 3) convert to OpenAI-style list for your LLM call
         conv: list[dict[str, Any]] = [
@@ -652,8 +647,6 @@ class OpenAIOrchestrator:
             model=model,
             extra={"user_request_id": request_id},
         )
-        # Ensure token count is computed
-        assistant_ev.compute_and_cache_tokens()
         await self.repo.add_event(assistant_ev)
 
         return assistant_ev
