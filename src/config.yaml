@@ -47,7 +47,7 @@ chat:
 
 # LLM Configuration - Just change the 'active' provider!
 llm:
-  active: "openai"  # Change this to: openai, groq, openrouter, anthropic, azure
+  active: "anthropic"  # Change this to: openai, groq, openrouter, anthropic, azure
 
   # HTTP client configuration
   http:

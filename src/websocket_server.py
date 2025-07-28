@@ -5,6 +5,8 @@ This module provides a thin communication layer between the frontend and chat se
 It handles WebSocket connections and message routing only.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import uuid
@@ -14,6 +16,7 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+from src.anthropic_orchestrator import AnthropicOrchestrator
 from src.history.chat_store import ChatRepository
 from src.openai_orchestrator import OpenAIOrchestrator
 
@@ -22,6 +25,40 @@ if TYPE_CHECKING:
     from src.main import MCPClient
 
 logger = logging.getLogger(__name__)
+
+
+def create_orchestrator(
+    clients: list[MCPClient],
+    llm_config: dict[str, Any],
+    config: dict[str, Any],
+    repo: ChatRepository,
+) -> OpenAIOrchestrator | AnthropicOrchestrator:
+    """
+    Factory function to create the appropriate orchestrator based on config.
+
+    Args:
+        clients: List of MCP clients
+        llm_config: LLM configuration dictionary
+        config: Full configuration dictionary
+        repo: Chat repository for persistence
+
+    Returns:
+        Appropriate orchestrator instance based on llm.active config
+
+    Raises:
+        ValueError: If the provider is not supported
+    """
+    active_provider = llm_config.get("active", "").lower()
+
+    if active_provider == "anthropic":
+        return AnthropicOrchestrator(clients, llm_config, config, repo)
+    if active_provider in ("openai", "groq", "openrouter", "azure"):
+        return OpenAIOrchestrator(clients, llm_config, config, repo)
+
+    raise ValueError(
+        f"Unsupported LLM provider: '{active_provider}'. "
+        f"Supported providers: openai, groq, openrouter, azure, anthropic"
+    )
 
 
 class WebSocketServer:
@@ -33,19 +70,17 @@ class WebSocketServer:
     - Message parsing and routing
     - Response streaming
 
-    All business logic is delegated to OpenAIOrchestrator.
+    All business logic is delegated to the appropriate orchestrator.
     """
 
     def __init__(
         self,
-        clients: list["MCPClient"],
+        clients: list[MCPClient],
         llm_config: dict[str, Any],
         config: dict[str, Any],
         repo: ChatRepository,
     ):
-        self.chat_service = OpenAIOrchestrator(
-            clients, llm_config, config, repo
-        )
+        self.chat_service = create_orchestrator(clients, llm_config, config, repo)
         self.repo = repo
         self.config = config
         self.app = self._create_app()
@@ -376,7 +411,7 @@ class WebSocketServer:
 
 
 async def run_websocket_server(
-    clients: list["MCPClient"],
+    clients: list[MCPClient],
     llm_config: dict[str, Any],
     config: dict[str, Any],
     repo: ChatRepository,
