@@ -170,11 +170,23 @@ class ResilientHttpClient:
         """Generate streaming JSON responses with retry logic."""
         last_error: Exception | None = None
 
+        # Add streaming-specific headers for better performance
+        streaming_headers = {
+            "Accept": "text/event-stream",
+            "Accept-Encoding": "identity",  # Important for less buffering
+            "Connection": "keep-alive",
+        }
+
         for attempt in range(self.config.max_retries + 1):
             try:
                 await self._exponential_backoff_delay(attempt)
 
-                async with self.http.stream("POST", url, json=payload) as response:
+                async with self.http.stream(
+                    "POST",
+                    url,
+                    json=payload,
+                    headers=streaming_headers
+                ) as response:
                     response.raise_for_status()
                     async for line in response.aiter_lines():
                         if line.startswith("data: "):
