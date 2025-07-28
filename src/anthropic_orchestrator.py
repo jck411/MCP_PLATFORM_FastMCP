@@ -16,8 +16,9 @@ import contextlib
 import json
 import logging
 import os
-from collections.abc import AsyncGenerator
-from typing import TYPE_CHECKING, Any
+from collections.abc import AsyncGenerator, AsyncIterator
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 from mcp import types
@@ -26,11 +27,10 @@ from src.history.chat_store import ChatEvent, ChatRepository, ToolCall, Usage
 from src.history.persistence import ConversationPersistenceService
 from src.http_resilience import ResilientHttpClient, create_http_config_from_dict
 from src.mcp_services.prompting import MCPResourcePromptService
+from src.schema_manager import SchemaManager
 
 if TYPE_CHECKING:
-    from src.main import MCPClient
-
-from src.schema_manager import SchemaManager
+    from src.main import MCPClient  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
@@ -38,20 +38,49 @@ logger = logging.getLogger(__name__)
 MAX_TOOL_HOPS = 8
 
 # Maximum size for a single text delta to prevent memory issues (10KB)
-MAX_TEXT_DELTA_SIZE = 10000
+MAX_TEXT_DELTA_SIZE = 10_000
 
 
+# -----------------------------
+# Exceptions
+# -----------------------------
+class OrchestratorError(Exception):
+    """Base class for orchestrator errors."""
+
+
+class InitializationError(OrchestratorError):
+    """Raised when orchestrator is used before initialization."""
+
+
+class TransportError(OrchestratorError):
+    """Raised when HTTP/stream transport contracts are violated."""
+
+
+class UpstreamProtocolError(OrchestratorError):
+    """Raised when upstream provider protocol is violated/unexpected."""
+
+
+class ToolExecutionError(OrchestratorError):
+    """Raised for tool execution / argument parse failures."""
+
+
+# -----------------------------
+# Data Models
+# -----------------------------
+@dataclass(slots=True)
 class ChatMessage:
     """
     Represents a chat message with metadata.
     """
 
-    def __init__(
-        self, mtype: str, content: str, meta: dict[str, Any] | None = None
-    ):
-        self.type = mtype
-        self.content = content
-        self.meta = meta if meta is not None else {}
+    mtype: Literal["text", "error"]
+    content: str
+    meta: dict[str, Any]
+
+    # Backwards accessor parity with your prior code
+    @property
+    def type(self) -> str:  # pragma: no cover
+        return self.mtype
 
 
 class AnthropicOrchestrator:
@@ -77,7 +106,7 @@ class AnthropicOrchestrator:
         self.repo = repo
         self.persist = ConversationPersistenceService(repo)
         self.max_history_messages = max_history_messages
-        self.chat_conf = config.get("chat", {}).get("service", {})
+        self.chat_conf = config.get("chat", {}).get("service", {}) or {}
         self.tool_mgr: SchemaManager | None = None
         self._init_lock = asyncio.Lock()
         self._ready = asyncio.Event()
@@ -87,7 +116,7 @@ class AnthropicOrchestrator:
         # Establish provider fields first
         self.active_name = (llm_config.get("active") or "").lower()
         providers = llm_config.get("providers") or {}
-        self.provider_cfg = providers.get(self.active_name, {})
+        self.provider_cfg = providers.get(self.active_name, {}) or {}
 
         # Extract API key and base URL
         self.api_key = self._extract_api_key()
@@ -95,12 +124,12 @@ class AnthropicOrchestrator:
 
         # Validate required configuration
         if not self.api_key:
-            raise RuntimeError(
+            raise InitializationError(
                 f"Missing API key: set {self.active_name.upper()}_API_KEY or "
                 f"providers['{self.active_name}']['api_key']"
             )
         if not self.base_url:
-            raise RuntimeError("Missing base_url in provider config")
+            raise InitializationError("Missing base_url in provider config")
 
         # Create HTTP resilience configuration
         http_config = create_http_config_from_dict(llm_config)
@@ -109,10 +138,13 @@ class AnthropicOrchestrator:
         if "timeout" in self.provider_cfg:
             http_config.timeout = self.provider_cfg["timeout"]
 
+        # Configure Anthropic version from provider config, fallback to default
+        anthropic_version = self.provider_cfg.get("anthropic_version", "2023-06-01")
+
         # Configure resilient HTTP client with Anthropic-specific headers
         headers = {
             "x-api-key": self.api_key,
-            "anthropic-version": "2023-06-01",
+            "anthropic-version": anthropic_version,
             "content-type": "application/json",
             "User-Agent": "MCP-Platform/1.0",
         }
@@ -120,17 +152,14 @@ class AnthropicOrchestrator:
         self.http_client = ResilientHttpClient(
             base_url=self.base_url,
             headers=headers,
-            config=http_config
+            config=http_config,
         )
 
     def _extract_api_key(self) -> str:
         """Extract API key from env or provider config; raise if absent."""
         provider_name = (self.llm_config.get("active") or "").upper()
         env_key = f"{provider_name}_API_KEY"
-        return (
-            os.getenv(env_key)
-            or self.provider_cfg.get("api_key", "")
-        )
+        return os.getenv(env_key) or self.provider_cfg.get("api_key", "") or ""
 
     @property
     def model(self) -> str:
@@ -140,77 +169,121 @@ class AnthropicOrchestrator:
     def _system_prompt_from_messages(
         self, messages: list[dict[str, Any]]
     ) -> str | None:
-        """Extract system prompt from messages."""
+        """Extract the most recent system prompt from messages if present."""
         for m in messages:
-            if m["role"] == "system":
-                return m["content"]
+            if m.get("role") == "system":
+                return m.get("content") or None
         return None
+
+    @staticmethod
+    def _normalize_text_content_to_blocks(content: Any) -> list[dict[str, Any]]:
+        """
+        Ensure assistant/user content is a list of content blocks.
+        Accepts either a plain string or an existing list of blocks.
+        """
+        if content is None:
+            return []
+        if isinstance(content, list):
+            return content
+        # Fallback: treat as text
+        return [{"type": "text", "text": str(content)}]
 
     def _to_anthropic_messages(
         self, messages: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Convert OpenAI-style messages to Anthropic format."""
+        """
+        Convert OpenAI-style messages (plus our tool-call shape) to Anthropic format.
+
+        Rules:
+          - System messages are dropped here; they are sent via payload["system"].
+          - Tool results are turned into user-side `tool_result` blocks attached
+            to the next/last user message.
+          - Assistant messages always use a list of content blocks.
+        """
         out: list[dict[str, Any]] = []
+
         for m in messages:
-            role = m["role"]
+            role = m.get("role")
             if role == "system":
+                # Exclude; handled by payload["system"]
                 continue
+
             if role == "tool":
-                # Convert OpenAI tool format to Anthropic tool_result format
-                tool_result = {
+                # Convert to a tool_result block and attach to the most recent user
+                # message, or create a new user message if needed.
+                tool_call_id = m.get("tool_call_id")
+                content_text = m.get("content", "")
+                tool_result_block = {
                     "type": "tool_result",
-                    "tool_use_id": m["tool_call_id"],
-                    "content": m["content"]
+                    "tool_use_id": tool_call_id,
+                    "content": (
+                        content_text
+                        if isinstance(content_text, str)
+                        else json.dumps(content_text)
+                    ),
                 }
-                # Check if last message is a user message and append to it
+
                 if out and out[-1]["role"] == "user":
                     if isinstance(out[-1]["content"], list):
-                        out[-1]["content"].append(tool_result)
+                        out[-1]["content"].append(tool_result_block)
                     else:
-                        # Convert string content to list and add tool_result
                         out[-1]["content"] = [
-                            {"type": "text", "text": out[-1]["content"]},
-                            tool_result
+                            {"type": "text", "text": str(out[-1]["content"])},
+                            tool_result_block,
                         ]
                 else:
-                    # Create new user message with tool_result
-                    out.append({
-                        "role": "user",
-                        "content": [tool_result]
-                    })
-            elif role == "assistant":
-                # Handle assistant messages with potential tool_calls
-                content_blocks = []
-                if text_content := m.get("content"):
-                    content_blocks.append({"type": "text", "text": text_content})
+                    out.append({"role": "user", "content": [tool_result_block]})
+                continue
 
-                if tool_calls := m.get("tool_calls"):
-                    for call in tool_calls:
-                        content_blocks.append({
+            if role == "assistant":
+                content_blocks: list[dict[str, Any]] = []
+                if m.get("content"):
+                    content_blocks.extend(
+                        self._normalize_text_content_to_blocks(m.get("content"))
+                    )
+
+                tool_calls = m.get("tool_calls") or []
+                for call in tool_calls:
+                    content_blocks.append(
+                        {
                             "type": "tool_use",
                             "id": call["id"],
                             "name": call["function"]["name"],
-                            "input": json.loads(call["function"]["arguments"])
-                        })
+                            # Note: Anthropic expects structured input;
+                            # we store as parsed JSON
+                            "input": json.loads(call["function"]["arguments"]),
+                        }
+                    )
 
-                out.append({
-                    "role": "assistant",
-                    "content": content_blocks if content_blocks else ""
-                })
+                out.append({"role": "assistant", "content": content_blocks})
+                continue
+
+            # user or other roles -> normalize to blocks if text, pass through
+            if role == "user":
+                out.append(
+                    {
+                        "role": "user",
+                        "content": self._normalize_text_content_to_blocks(
+                            m.get("content")
+                        ),
+                    }
+                )
             else:
-                # Regular user message - use simple string format for text-only messages
-                out.append({"role": role, "content": m["content"]})
+                # Fallback: pass through (rare)
+                out.append({"role": role, "content": m.get("content", "")})
         return out
 
     def _to_anthropic_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Convert MCP tools to Anthropic format."""
         res = []
-        for t in tools:
-            res.append({
-                "name": t["name"],
-                "description": t.get("description", ""),
-                "input_schema": t["inputSchema"],
-            })
+        for t in tools or []:
+            res.append(
+                {
+                    "name": t["name"],
+                    "description": t.get("description", ""),
+                    "input_schema": t["inputSchema"],
+                }
+            )
         return res
 
     async def initialize(self) -> None:
@@ -229,7 +302,9 @@ class AnthropicOrchestrator:
             for i, result in enumerate(connection_results):
                 if isinstance(result, Exception):
                     logger.warning(
-                        f"Client '{self.clients[i].name}' failed to connect: {result}"
+                        "Client '%s' failed to connect: %s",
+                        self.clients[i].name,
+                        result,
                     )
                 else:
                     connected_clients.append(self.clients[i])
@@ -240,8 +315,9 @@ class AnthropicOrchestrator:
                 )
             else:
                 logger.info(
-                    f"Successfully connected to {len(connected_clients)} out of "
-                    f"{len(self.clients)} MCP clients"
+                    "Successfully connected to %d out of %d MCP clients",
+                    len(connected_clients),
+                    len(self.clients),
                 )
 
             # Use connected clients for tool management (empty list is acceptable)
@@ -277,14 +353,14 @@ class AnthropicOrchestrator:
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
     ) -> dict[str, Any]:
         """Build Anthropic API request payload."""
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.model,
             "messages": self._to_anthropic_messages(messages),
             "max_tokens": self.provider_cfg.get("max_tokens", 2048),
             "temperature": self.provider_cfg.get("temperature", 0.1),
         }
 
-        # Extract system prompt from messages
+        # Extract system prompt from messages (most recent wins)
         sys_prompt = self._system_prompt_from_messages(messages)
         if sys_prompt:
             payload["system"] = sys_prompt
@@ -296,30 +372,32 @@ class AnthropicOrchestrator:
 
     def _parse_anthropic_response(self, data: dict[str, Any]) -> dict[str, Any]:
         """Parse Anthropic API response."""
-        text_parts, tool_calls = [], []
+        text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
 
-        for item in data["content"]:
-            if item["type"] == "text":
-                text_content = item["text"]
-                text_parts.append(text_content)
-
-            elif item["type"] == "tool_use":
-                tool_calls.append({
-                    "id": item["id"],
-                    "type": "function",
-                    "function": {
-                        "name": item["name"],
-                        "arguments": json.dumps(item["input"]),
-                    },
-                })
+        for item in data.get("content", []):
+            if item.get("type") == "text":
+                text_content = item.get("text", "")
+                if text_content:
+                    text_parts.append(text_content)
+            elif item.get("type") == "tool_use":
+                tool_calls.append(
+                    {
+                        "id": item["id"],
+                        "type": "function",
+                        "function": {
+                            "name": item["name"],
+                            "arguments": json.dumps(item.get("input", {})),
+                        },
+                    }
+                )
 
         usage = data.get("usage", {})
         normalized_usage = {
             "prompt_tokens": usage.get("input_tokens", 0),
             "completion_tokens": usage.get("output_tokens", 0),
-            "total_tokens": (
-                usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-            ),
+            "total_tokens": usage.get("input_tokens", 0)
+            + usage.get("output_tokens", 0),
         }
 
         stop_map = {
@@ -333,9 +411,10 @@ class AnthropicOrchestrator:
 
         return {
             "message": {
-                "content": "\n".join(text_parts),
+                "content": "\n".join(text_parts) if text_parts else None,
                 "tool_calls": tool_calls or None,
                 "finish_reason": finish_reason,
+                "anthropic_stop_reason": stop_reason,  # keep original for debugging
             },
             "finish_reason": finish_reason,
             "usage": normalized_usage,
@@ -351,84 +430,111 @@ class AnthropicOrchestrator:
 
         # For non-streaming, we expect an httpx.Response
         if isinstance(response, httpx.Response):
-            return self._parse_anthropic_response(response.json())
+            try:
+                return self._parse_anthropic_response(response.json())
+            except Exception as e:  # pragma: no cover
+                raise UpstreamProtocolError(
+                    f"Invalid JSON in upstream response: {e}"
+                ) from e
 
-        raise TypeError("Expected httpx.Response for non-streaming request")
+        raise TransportError("Expected httpx.Response for non-streaming request")
 
     async def _stream_anthropic_api(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
-    ) -> AsyncGenerator[dict[str, Any]]:
-        """Stream responses from Anthropic API with retry logic."""
+    ) -> AsyncIterator[dict[str, Any]]:
+        """
+        Stream responses from Anthropic API with retry logic.
+
+        Contract:
+          - The HTTP client should return an async-iterable of SSE/event dicts
+            when stream=True.
+          - Each item is either a dict (already parsed) or a string SSE line
+            "data: {...}".
+        """
         payload = self._build_anthropic_request(messages, tools)
         payload["stream"] = True
 
-        response_gen = await self.http_client.post_json(
-            "/messages", payload, stream=True
-        )
+        stream_obj = await self.http_client.post_json("/messages", payload, stream=True)
 
-        # For streaming, we expect an AsyncGenerator that yields SSE data
-        if not isinstance(response_gen, httpx.Response):
-            async for chunk in response_gen:
-                # OPTIMIZATION: Faster SSE parsing with error resilience
+        # path 1: some clients improperly return a Response even for stream=True
+        if isinstance(stream_obj, httpx.Response):  # pragma: no cover
+            raise TransportError(
+                "Got httpx.Response for streaming request; async iterator expected"
+            )
+
+        # path 2: async iterator contract
+        if hasattr(stream_obj, "__aiter__"):
+            async for chunk in stream_obj:  # type: ignore[assignment]
                 try:
+                    # If chunk comes as dict -> yield the 'data' field or
+                    # the dict itself
                     if isinstance(chunk, dict):
-                        # Pre-parsed JSON from SSE
-                        if "data" in chunk:
-                            yield chunk["data"]
-                        else:
-                            yield chunk
-                    elif isinstance(chunk, str) and chunk.startswith("data: "):
-                        # OPTIMIZATION: Avoid str() conversion, use slice directly
-                        data_str = chunk[6:].strip()  # Remove "data: " prefix
+                        yield chunk.get("data", chunk)
+                        continue
+
+                    # If chunk comes as SSE line string
+                    if isinstance(chunk, str) and chunk.startswith("data: "):
+                        data_str = chunk[6:].strip()
                         if data_str and data_str != "[DONE]":
                             with contextlib.suppress(json.JSONDecodeError):
                                 yield json.loads(data_str)
-                except Exception as e:
-                    # Log but don't stop streaming for malformed chunks
-                    logger.warning(f"Skipping malformed SSE chunk: {e}")
+                        continue
+
+                    # Unknown type: ignore, but log at debug
+                    logger.debug("Ignoring unknown stream chunk type: %r", type(chunk))
+                except Exception as e:  # Robust to malformed chunks
+                    logger.warning("Skipping malformed SSE chunk: %s", e)
                     continue
             return
 
-        raise TypeError("Expected AsyncGenerator for streaming request")
+        # Otherwise: we don't know how to read this stream
+        raise TransportError("Streaming transport did not return an async iterator")
 
     async def _build_conversation_history(
         self, conversation_id: str
     ) -> list[dict[str, Any]]:
-        """Build conversation history including tool calls and results."""
+        """
+        Build conversation history including tool calls and results.
+
+        Canonical transcript representation used for both streaming and
+        non-streaming paths.
+        """
         events = await self.repo.get_events(conversation_id, self.max_history_messages)
         conv: list[dict[str, Any]] = [
-            {"role": "system", "content": self._system_prompt},
+            {"role": "system", "content": self._system_prompt}
         ]
 
         for ev in events:
             if ev.type in ("user_message", "assistant_message", "system_update"):
                 conv.append({"role": ev.role, "content": ev.content})
+
             elif ev.type == "tool_call" and ev.tool_calls:
-                # Add assistant message with tool calls
                 tool_calls = []
                 for tc in ev.tool_calls:
-                    tool_calls.append({
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)
+                    tool_calls.append(
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.arguments),
+                            },
                         }
-                    })
-                conv.append({
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": tool_calls
-                })
+                    )
+                conv.append(
+                    {"role": "assistant", "content": None, "tool_calls": tool_calls}
+                )
+
             elif ev.type == "tool_result":
-                # Add tool result message
-                tool_call_id = ev.extra.get("tool_call_id")
+                tool_call_id = ev.extra.get("tool_call_id") if ev.extra else None
                 if tool_call_id:
-                    conv.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": ev.content or ""
-                    })
+                    conv.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "content": ev.content or "",
+                        }
+                    )
 
         return conv
 
@@ -445,14 +551,14 @@ class AnthropicOrchestrator:
         await self._ready.wait()
 
         if not self.tool_mgr:
-            raise RuntimeError("Tool manager not initialized")
+            raise InitializationError("Tool manager not initialized")
 
         # Check for existing response to prevent double-processing
         existing_response = await self.persist.get_existing_assistant_response(
             conversation_id, request_id
         )
         if existing_response:
-            logger.info(f"Returning cached response for request_id: {request_id}")
+            logger.info("Returning cached response for request_id: %s", request_id)
             cached_text = self.persist.get_cached_text(existing_response)
             if cached_text:
                 yield ChatMessage("text", cached_text, {"type": "cached"})
@@ -473,7 +579,7 @@ class AnthropicOrchestrator:
                     yield ChatMessage("text", cached_text, {"type": "cached"})
                 return
 
-        # 2) Build conversation history from persistent store
+        # 2) Build conversation history from persistent store (canonical)
         conv = await self._build_conversation_history(conversation_id)
 
         # 3) Generate streaming response with tool handling
@@ -482,44 +588,57 @@ class AnthropicOrchestrator:
         ):
             yield msg
 
-    async def _process_streaming_with_tools(
+    async def _process_streaming_with_tools(  # noqa: PLR0912, PLR0915
         self, conv: list[dict[str, Any]], conversation_id: str, request_id: str
     ) -> AsyncGenerator[ChatMessage]:
         """Handle the streaming response generation and tool execution."""
-        assert self.tool_mgr is not None
+        if not self.tool_mgr:
+            raise InitializationError("Tool manager not initialized")
 
         tools_payload = self.tool_mgr.get_mcp_tools()
         full_assistant_content = ""
-
-        # Initial response - stream and collect
         assistant_msg: dict[str, Any] = {}
-        async for chunk in self._stream_llm_response(conv, tools_payload):
-            if isinstance(chunk, ChatMessage):
-                yield chunk
-                # Collect content for final persistence
-                if chunk.type == "text":
-                    full_assistant_content += chunk.content
-            else:
-                assistant_msg = chunk
 
-        # Log LLM reply if configured
-        reply_data = {
-            "message": assistant_msg,
-            "usage": None,  # Usage not available in streaming mode
-            "model": self.model
-        }
+        try:
+            # Initial response - stream and collect
+            async for chunk in self._stream_llm_response(conv, tools_payload):
+                if isinstance(chunk, ChatMessage):
+                    # User-facing text deltas
+                    yield chunk
+                    if chunk.mtype == "text":
+                        full_assistant_content += chunk.content
+                else:
+                    assistant_msg = chunk
+        except asyncio.CancelledError:
+            # Respect cancellation and attempt minimal cleanup semantics if needed
+            logger.info("Streaming cancelled by upstream")
+            raise
+        except Exception as e:
+            logger.error("Streaming error: %s", e)
+            yield ChatMessage(
+                "error",
+                f"Streaming interrupted: {e!s}",
+                {"type": "error", "recoverable": True},
+            )
+
+        # Log LLM reply if configured (streaming usage unknown)
+        reply_data = {"message": assistant_msg, "usage": None, "model": self.model}
         self._log_llm_reply(reply_data, "Streaming initial response")
 
-        # Handle tool calls in a loop
+        # Handle tool calls in a loop with cycle detection
         hops = 0
-        while calls := assistant_msg.get("tool_calls"):
+        seen_calls: set[tuple[str, str]] = set()
+
+        while assistant_msg.get("tool_calls"):
+            calls: list[dict[str, Any]] = assistant_msg["tool_calls"]
+
             if hops >= MAX_TOOL_HOPS:
                 logger.warning(
-                    f"Maximum tool hops ({MAX_TOOL_HOPS}) reached, stopping recursion"
+                    "Maximum tool hops (%d) reached, stopping recursion", MAX_TOOL_HOPS
                 )
                 error_msg = (
                     f"⚠️ Reached maximum tool call limit ({MAX_TOOL_HOPS}). "
-                    "Stopping to prevent infinite recursion."
+                    f"Stopping to prevent infinite recursion."
                 )
                 yield ChatMessage(
                     "text", error_msg, {"finish_reason": "tool_limit_reached"}
@@ -536,28 +655,37 @@ class AnthropicOrchestrator:
                 }
             )
 
-            # Execute tool calls
-            await self._execute_tool_calls(conv, calls, conversation_id, request_id)
+            # Execute tool calls (with parse guards & persistence)
+            await self._execute_tool_calls(
+                conv, calls, conversation_id, request_id, seen_calls
+            )
 
             # Get follow-up response - stream and collect
             assistant_msg = {}
-            async for chunk in self._stream_llm_response(conv, tools_payload):
-                if isinstance(chunk, ChatMessage):
-                    yield chunk
-                    # Collect content for final persistence
-                    if chunk.type == "text":
-                        full_assistant_content += chunk.content
-                else:
-                    assistant_msg = chunk
+            try:
+                async for chunk in self._stream_llm_response(conv, tools_payload):
+                    if isinstance(chunk, ChatMessage):
+                        yield chunk
+                        if chunk.mtype == "text":
+                            full_assistant_content += chunk.content
+                    else:
+                        assistant_msg = chunk
+            except asyncio.CancelledError:
+                logger.info("Streaming cancelled by upstream during tool follow-up")
+                raise
+            except Exception as e:
+                logger.error("Streaming error during tool follow-up: %s", e)
+                yield ChatMessage(
+                    "error",
+                    f"Streaming interrupted: {e!s}",
+                    {"type": "error", "recoverable": True},
+                )
 
             # Log LLM reply if configured
-            reply_data = {
-                "message": assistant_msg,
-                "usage": None,  # Usage not available in streaming mode
-                "model": self.model
-            }
-            context = f"Streaming tool follow-up (hop {hops + 1})"
-            self._log_llm_reply(reply_data, context)
+            reply_data = {"message": assistant_msg, "usage": None, "model": self.model}
+            self._log_llm_reply(
+                reply_data, f"Streaming tool follow-up (hop {hops + 1})"
+            )
 
             hops += 1
 
@@ -581,37 +709,37 @@ class AnthropicOrchestrator:
         str | None,
     ]:
         """Handle a single chunk from the Anthropic streaming response."""
-        text_delta = None
-
+        text_delta: str | None = None
         chunk_type = chunk.get("type")
+
         if chunk_type == "message_start":
             pass
+
         elif chunk_type == "content_block_start":
             block = chunk.get("content_block", {})
             if block.get("type") == "tool_use":
                 current_tool_use = {
                     "id": block.get("id", ""),
                     "type": "function",
-                    "function": {
-                        "name": block.get("name", ""),
-                        "arguments": ""
-                    }
+                    "function": {"name": block.get("name", ""), "arguments": ""},
                 }
+
         elif chunk_type == "content_block_delta":
             delta = chunk.get("delta", {})
             delta_type = delta.get("type")
             if delta_type == "text_delta":
-                # OPTIMIZATION: Text deltas handled directly in _stream_llm_response
-                # Return delta but don't update buffer to avoid double processing
                 text_delta = delta.get("text", "")
-                # Buffer update handled in _stream_llm_response
+                # Buffering handled by _stream_llm_response
             elif delta_type == "input_json_delta" and current_tool_use:
+                # Accumulate raw JSON string fragments; errors handled on parse
                 partial_json = delta.get("partial_json", "")
                 current_tool_use["function"]["arguments"] += partial_json
+
         elif chunk_type == "content_block_stop":
             if current_tool_use:
                 current_tool_calls.append(current_tool_use)
                 current_tool_use = None
+
         elif chunk_type == "message_delta":
             delta = chunk.get("delta", {})
             if "stop_reason" in delta:
@@ -622,8 +750,10 @@ class AnthropicOrchestrator:
                     "stop_sequence": "stop",
                 }
                 finish_reason = stop_map.get(delta["stop_reason"])
+
         elif chunk_type == "message_stop":
-            pass  # Signal to break the loop
+            # caller breaks the loop when it sees this
+            pass
 
         return (
             message_buffer,
@@ -634,42 +764,25 @@ class AnthropicOrchestrator:
         )
 
     def _validate_text_delta(self, text_delta: str) -> bool:
-        """
-        Validate text delta before immediate yielding.
-
-        Args:
-            text_delta: The text content to validate
-
-        Returns:
-            True if the text delta is safe to yield immediately
-        """
+        """Validate text delta before immediate yielding."""
         if not isinstance(text_delta, str):
-            logger.warning(f"Invalid text delta type: {type(text_delta)}")
+            logger.warning("Invalid text delta type: %s", type(text_delta))
             return False
-
-        # Check for reasonable length (prevent memory issues)
         if len(text_delta) > MAX_TEXT_DELTA_SIZE:
-            logger.warning(f"Text delta too large: {len(text_delta)} chars")
+            logger.warning("Text delta too large: %d chars", len(text_delta))
             return False
-
-        # Could add more validation here (encoding, content filtering, etc.)
         return True
 
     def _should_accumulate_buffer(self) -> bool:
-        """
-        Determine if we should accumulate the full message buffer.
-
-        Returns:
-            True if buffer accumulation is needed (for persistence, tool calls, etc.)
-        """
-        # Always accumulate for now - needed for tool calls and persistence
-        # Could optimize this for pure streaming scenarios in the future
+        """Whether to accumulate the full message buffer (needed for
+        persistence & tools)."""
         return True
 
-    async def _stream_llm_response(
+    async def _stream_llm_response(  # noqa: PLR0912
         self, conv: list[dict[str, Any]], tools_payload: list[dict[str, Any]]
     ) -> AsyncGenerator[ChatMessage | dict[str, Any]]:
-        """Stream response from LLM and yield chunks to user."""
+        """Stream response from LLM and yield chunks to user, ending with the
+        final assistant message dict."""
         message_buffer = ""
         current_tool_calls: list[dict[str, Any]] = []
         finish_reason: str | None = None
@@ -677,40 +790,35 @@ class AnthropicOrchestrator:
 
         try:
             async for chunk in self._stream_anthropic_api(conv, tools_payload):
-                # OPTIMIZATION: Extract text deltas immediately with validation
                 chunk_type = chunk.get("type")
 
-                # Handle text deltas with immediate yielding (like OpenAI) + validation
+                # Fast path: text deltas, validate + yield
                 if chunk_type == "content_block_delta":
                     delta = chunk.get("delta", {})
-                    delta_type = delta.get("type")
-                    if delta_type == "text_delta":
+                    if delta.get("type") == "text_delta":
                         text_delta = delta.get("text", "")
                         if text_delta and self._validate_text_delta(text_delta):
-                            # Debug logging for text streaming (can be enabled)
                             if logger.isEnabledFor(logging.DEBUG):
                                 logger.debug(
-                                    f"Yielding text delta: {text_delta[:50]!r}..."
+                                    "Yielding text delta: %r...", text_delta[:50]
                                 )
-
                             if self._should_accumulate_buffer():
                                 message_buffer += text_delta
                             yield ChatMessage("text", text_delta, {"type": "delta"})
-                            continue  # Skip full processing for validated text deltas
+                            continue
                         elif text_delta:
-                            # Invalid text delta - log but don't yield
                             logger.warning(
-                                f"Skipping invalid text delta: {text_delta[:100]!r}"
+                                "Skipping invalid text delta: %r", text_delta[:100]
                             )
                             continue
 
-                # Handle other chunk types normally (tool calls, etc.)
+                # Other chunk handling
                 (
                     message_buffer,
                     current_tool_calls,
                     current_tool_use,
                     finish_reason,
-                    _  # text_delta already handled above
+                    _,
                 ) = self._handle_stream_chunk(
                     chunk,
                     message_buffer,
@@ -719,38 +827,37 @@ class AnthropicOrchestrator:
                     finish_reason,
                 )
 
-                # Break on message_stop
                 if chunk_type == "message_stop":
                     break
 
+        except asyncio.CancelledError:
+            logger.info("Streaming cancelled")
+            raise
         except Exception as e:
-            logger.error(f"Streaming error: {e}")
-            # Yield error message to user
+            logger.error("Streaming error: %s", e)
             yield ChatMessage(
                 "error",
                 f"Streaming interrupted: {e!s}",
-                {"type": "error", "recoverable": True}
+                {"type": "error", "recoverable": True},
             )
-            # Continue with whatever we have so far
 
-        # Yield complete assistant message as final item
+        # Final assistant message for internal control-flow
         assistant_message = {
             "content": message_buffer or None,
             "tool_calls": current_tool_calls if current_tool_calls else None,
-            "finish_reason": finish_reason
+            "finish_reason": finish_reason,
         }
 
-        # Debug logging for tool calls
         if assistant_message.get("tool_calls"):
-            logger.info(f"Tool calls detected: {len(assistant_message['tool_calls'])}")
-            for i, call in enumerate(assistant_message['tool_calls']):
-                func_name = call['function']['name']
-                func_args = call['function']['arguments']
-                logger.info(f"  Tool {i+1}: {func_name} with args: {func_args}")
+            logger.info("Tool calls detected: %d", len(assistant_message["tool_calls"]))
+            for i, call in enumerate(assistant_message["tool_calls"]):
+                func_name = call["function"]["name"]
+                func_args = call["function"]["arguments"]
+                logger.info("  Tool %d: %s with args: %s", i + 1, func_name, func_args)
         else:
             logger.info("No tool calls detected in response")
-            logger.info(f"current_tool_calls buffer: {current_tool_calls}")
-            logger.info(f"finish_reason: {finish_reason}")
+            logger.debug("current_tool_calls buffer: %s", current_tool_calls)
+            logger.debug("finish_reason: %s", finish_reason)
 
         yield assistant_message
 
@@ -759,41 +866,143 @@ class AnthropicOrchestrator:
         conv: list[dict[str, Any]],
         calls: list[dict[str, Any]],
         conversation_id: str,
-        request_id: str
+        request_id: str,
+        seen_calls: set[tuple[str, str]],
     ) -> None:
-        """Execute tool calls and add results to conversation and history."""
-        assert self.tool_mgr is not None
+        """
+        Execute tool calls and add results to conversation and history.
 
-        logger.info(f"Executing {len(calls)} tool calls")
+        Includes:
+          - Persistence of tool_call and tool_result events
+          - Cycle detection via (tool_name, args_json)
+          - Graceful handling of invalid JSON args from streamed deltas
+        """
+        if not self.tool_mgr:
+            raise InitializationError("Tool manager not initialized")
+
+        logger.info("Executing %d tool calls", len(calls))
 
         for call in calls:
             tool_name = call["function"]["name"]
-            args = json.loads(call["function"]["arguments"] or "{}")
+            raw_args = call["function"]["arguments"] or "{}"
+
+            # Try to parse arguments; on failure, surface the error to the model
+            try:
+                args = json.loads(raw_args)
+            except json.JSONDecodeError as e:
+                err_text = (
+                    f"[tool-args-error] Failed to parse JSON arguments for "
+                    f"'{tool_name}': {e}"
+                )
+                logger.warning(err_text)
+                # Persist the tool call with raw args for audit
+                tool_call_event = ChatEvent(
+                    conversation_id=conversation_id,
+                    type="tool_call",
+                    role="assistant",
+                    tool_calls=[
+                        ToolCall(
+                            id=call["id"],
+                            name=tool_name,
+                            arguments={"__raw__": raw_args},
+                        )
+                    ],
+                    extra={"user_request_id": request_id, "tool_call_id": call["id"]},
+                )
+                await self.repo.add_event(tool_call_event)
+
+                # Persist and add an explicit tool_result error so the model can recover
+                tool_result_content = json.dumps(
+                    {"error": "invalid_tool_arguments", "detail": str(e)}
+                )
+                tool_result_event = ChatEvent(
+                    conversation_id=conversation_id,
+                    type="tool_result",
+                    role="tool",
+                    content=tool_result_content,
+                    extra={
+                        "user_request_id": request_id,
+                        "tool_call_id": call["id"],
+                        "tool_name": tool_name,
+                    },
+                )
+                await self.repo.add_event(tool_result_event)
+
+                conv.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "content": tool_result_content,
+                    }
+                )
+                continue
+
+            # Cycle detection: avoid ping-pong loops
+            call_key = (tool_name, json.dumps(args, sort_keys=True))
+            if call_key in seen_calls:
+                logger.warning(
+                    "Cycle detected for tool '%s' with args %s; skipping",
+                    tool_name,
+                    call_key[1],
+                )
+                cycle_msg = json.dumps(
+                    {"warning": "tool_cycle_detected", "tool": tool_name, "args": args},
+                    ensure_ascii=False,
+                )
+                # Persist call + result (cycle notice)
+                tool_call_event = ChatEvent(
+                    conversation_id=conversation_id,
+                    type="tool_call",
+                    role="assistant",
+                    tool_calls=[
+                        ToolCall(id=call["id"], name=tool_name, arguments=args)
+                    ],
+                    extra={"user_request_id": request_id, "tool_call_id": call["id"]},
+                )
+                await self.repo.add_event(tool_call_event)
+                tool_result_event = ChatEvent(
+                    conversation_id=conversation_id,
+                    type="tool_result",
+                    role="tool",
+                    content=cycle_msg,
+                    extra={
+                        "user_request_id": request_id,
+                        "tool_call_id": call["id"],
+                        "tool_name": tool_name,
+                    },
+                )
+                await self.repo.add_event(tool_result_event)
+                conv.append(
+                    {"role": "tool", "tool_call_id": call["id"], "content": cycle_msg}
+                )
+                continue
+
+            seen_calls.add(call_key)
 
             # 1. Persist the tool call event
             tool_call_event = ChatEvent(
                 conversation_id=conversation_id,
                 type="tool_call",
                 role="assistant",  # Tool calls are initiated by assistant
-                tool_calls=[ToolCall(
-                    id=call["id"],
-                    name=tool_name,
-                    arguments=args
-                )],
-                extra={
-                    "user_request_id": request_id,
-                    "tool_call_id": call["id"]
-                }
+                tool_calls=[ToolCall(id=call["id"], name=tool_name, arguments=args)],
+                extra={"user_request_id": request_id, "tool_call_id": call["id"]},
             )
             await self.repo.add_event(tool_call_event)
 
-            logger.info(f"Calling tool '{tool_name}' with args: {args}")
+            logger.info("Calling tool '%s' with args: %s", tool_name, args)
 
             # 2. Execute the tool
-            result = await self.tool_mgr.call_tool(tool_name, args)
-
-            # Handle structured content
-            content = self._pluck_content(result)
+            try:
+                result = await self.tool_mgr.call_tool(tool_name, args)
+            except Exception as e:
+                logger.exception("Tool '%s' execution failed: %s", tool_name, e)
+                # Surface execution error to model
+                content = json.dumps(
+                    {"error": "tool_execution_failed", "detail": str(e)}
+                )
+            else:
+                # 2b. Handle structured content
+                content = self._pluck_content(result)
 
             # 3. Persist the tool result event
             tool_result_event = ChatEvent(
@@ -804,20 +1013,14 @@ class AnthropicOrchestrator:
                 extra={
                     "user_request_id": request_id,
                     "tool_call_id": call["id"],
-                    "tool_name": tool_name
-                }
+                    "tool_name": tool_name,
+                },
             )
             await self.repo.add_event(tool_result_event)
 
-            logger.info(f"Tool '{tool_name}' returned: {content[:100]}...")
-
             # 4. Add to conversation for immediate LLM context
             conv.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call["id"],
-                    "content": content,
-                }
+                {"role": "tool", "tool_call_id": call["id"], "content": content}
             )
 
     async def chat_once(
@@ -830,16 +1033,14 @@ class AnthropicOrchestrator:
         await self._ready.wait()
 
         if not self.tool_mgr:
-            raise RuntimeError("Tool manager not initialized")
+            raise InitializationError("Tool manager not initialized")
 
         # Check for existing response to prevent double-billing
         existing_response = await self.persist.get_existing_assistant_response(
             conversation_id, request_id
         )
         if existing_response:
-            logger.info(
-                f"Returning cached response for request_id: {request_id}"
-            )
+            logger.info("Returning cached response for request_id: %s", request_id)
             return existing_response
 
         # 1) persist user message FIRST with idempotency check
@@ -853,31 +1054,21 @@ class AnthropicOrchestrator:
             if existing_response:
                 logger.info(
                     "Returning existing response for duplicate request_id: %s",
-                    request_id
+                    request_id,
                 )
                 return existing_response
 
-        # 2) build canonical history from repo
-        events = await self.repo.get_events(conversation_id, self.max_history_messages)
+        # 2) build canonical history from repo (includes tool calls/results)
+        conv = await self._build_conversation_history(conversation_id)
 
-        # 3) convert to Anthropic-style list for your LLM call
-        conv: list[dict[str, Any]] = [
-            {"role": "system", "content": self._system_prompt},
-        ]
-        for ev in events:
-            if ev.type in ("user_message", "assistant_message", "system_update"):
-                conv.append({"role": ev.role, "content": ev.content})
-
-        # User message is already included in events since we persisted it above
-
-        # 4) Generate assistant response with usage tracking
+        # 3) Generate assistant response with usage tracking
         (
             assistant_full_text,
             total_usage,
-            model
+            model,
         ) = await self._generate_assistant_response(conv)
 
-        # 5) persist assistant message with usage and reference to user request
+        # 4) persist assistant message with usage and reference to user request
         assistant_ev = ChatEvent(
             conversation_id=conversation_id,
             type="assistant_message",
@@ -896,7 +1087,6 @@ class AnthropicOrchestrator:
         """Convert LLM API usage to our Usage model."""
         if not api_usage:
             return Usage()
-
         return Usage(
             prompt_tokens=api_usage.get("prompt_tokens", 0),
             completion_tokens=api_usage.get("completion_tokens", 0),
@@ -906,9 +1096,9 @@ class AnthropicOrchestrator:
     async def _generate_assistant_response(
         self, conv: list[dict[str, Any]]
     ) -> tuple[str, Usage, str]:
-        """Generate assistant response using tools if needed."""
+        """Generate assistant response using tools if needed (non-streaming path)."""
         if not self.tool_mgr:
-            raise RuntimeError("Tool manager not initialized")
+            raise InitializationError("Tool manager not initialized")
 
         tools_payload = self.tool_mgr.get_mcp_tools()
 
@@ -929,17 +1119,20 @@ class AnthropicOrchestrator:
             total_usage.completion_tokens += call_usage.completion_tokens
             total_usage.total_tokens += call_usage.total_tokens
 
-        # Store model from first API call
-        model = reply.get("model", "")
+        model = reply.get("model", "") or self.model
 
         if txt := assistant_msg.get("content"):
             assistant_full_text += txt
 
         hops = 0
-        while calls := assistant_msg.get("tool_calls"):
+        seen_calls: set[tuple[str, str]] = set()
+
+        while assistant_msg.get("tool_calls"):
+            calls: list[dict[str, Any]] = assistant_msg["tool_calls"]
+
             if hops >= MAX_TOOL_HOPS:
                 logger.warning(
-                    f"Maximum tool hops ({MAX_TOOL_HOPS}) reached, stopping recursion"
+                    "Maximum tool hops (%d) reached, stopping recursion", MAX_TOOL_HOPS
                 )
                 assistant_full_text += (
                     f"\n\n⚠️ Reached maximum tool call limit ({MAX_TOOL_HOPS}). "
@@ -955,21 +1148,16 @@ class AnthropicOrchestrator:
                 }
             )
 
-            for call in calls:
-                tool_name = call["function"]["name"]
-                args = json.loads(call["function"]["arguments"] or "{}")
+            # Execute tools (non-streaming path)
+            await self._execute_tool_calls(
+                conv,
+                calls,
+                conversation_id="__inline__",
+                request_id="__inline__",
+                seen_calls=seen_calls,
+            )
 
-                result = await self.tool_mgr.call_tool(tool_name, args)
-                content = self._pluck_content(result)
-
-                conv.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "content": content,
-                    }
-                )
-
+            # Follow-up call
             reply = await self._call_anthropic_api(conv, tools_payload)
             assistant_msg = reply["message"]
 
@@ -995,52 +1183,49 @@ class AnthropicOrchestrator:
         if not self.chat_conf.get("logging", {}).get("llm_replies", False):
             return
 
-        message = reply.get("message", {})
-        content = message.get("content", "")
-        tool_calls = message.get("tool_calls", [])
+        message = reply.get("message", {}) or {}
+        content = message.get("content", "") or ""
+        tool_calls = message.get("tool_calls", []) or []
 
         # Truncate content if configured
         logging_config = self.chat_conf.get("logging", {})
-        truncate_length = logging_config.get("llm_reply_truncate_length", 500)
+        truncate_length = int(logging_config.get("llm_reply_truncate_length", 500))
         if content and len(content) > truncate_length:
             content = content[:truncate_length] + "..."
 
-        log_parts = [f"LLM Reply ({context}):"]
-
+        parts = [f"LLM Reply ({context}):"]
         if content:
-            log_parts.append(f"Content: {content}")
+            parts.append(f"Content: {content}")
 
         if tool_calls:
-            log_parts.append(f"Tool calls: {len(tool_calls)}")
+            parts.append(f"Tool calls: {len(tool_calls)}")
             for i, call in enumerate(tool_calls):
                 func_name = call.get("function", {}).get("name", "unknown")
-                log_parts.append(f"  - Tool {i+1}: {func_name}")
+                parts.append(f"  - Tool {i + 1}: {func_name}")
 
-        usage = reply.get("usage", {})
+        usage = reply.get("usage", {}) or {}
         if usage:
-            prompt_tokens = usage.get('prompt_tokens', 0)
-            completion_tokens = usage.get('completion_tokens', 0)
-            total_tokens = usage.get('total_tokens', 0)
-            log_parts.append(
-                f"Usage: {prompt_tokens}p + {completion_tokens}c = {total_tokens}t"
-            )
+            p = usage.get("prompt_tokens", 0)
+            c = usage.get("completion_tokens", 0)
+            t = usage.get("total_tokens", 0)
+            parts.append(f"Usage: {p}p + {c}c = {t}t")
 
         model = reply.get("model", "unknown")
-        log_parts.append(f"Model: {model}")
+        parts.append(f"Model: {model}")
 
-        logger.info(" | ".join(log_parts))
+        logger.info(" | ".join(parts))
 
     def _pluck_content(self, res: types.CallToolResult) -> str:
         """Extract content from a tool call result."""
-        if not res.content:
+        if not getattr(res, "content", None):
             return "✓ done"
 
-        # Handle structured content
+        # Handle structured content if present
         if hasattr(res, "structuredContent") and res.structuredContent:
             try:
                 return json.dumps(res.structuredContent, indent=2)
-            except Exception as e:
-                logger.warning(f"Failed to serialize structured content: {e}")
+            except Exception as e:  # pragma: no cover
+                logger.warning("Failed to serialize structured content: %s", e)
 
         # Extract text from each piece of content
         out: list[str] = []
@@ -1062,24 +1247,32 @@ class AnthropicOrchestrator:
         return "\n".join(out)
 
     async def cleanup(self) -> None:
-        """Clean up resources by closing all connected MCP clients and HTTP client."""
-        if self.http_client:
-            await self.http_client.close()
+        """Clean up resources by closing all connected MCP clients and HTTP
+        client (idempotent)."""
+        # Close HTTP client first
+        if getattr(self, "http_client", None):
+            with contextlib.suppress(Exception):
+                await self.http_client.close()
 
-        if not self.tool_mgr:
-            raise RuntimeError("Tool manager not initialized")
+        # Close MCP clients (only if tool_mgr initialized)
+        tool_mgr = getattr(self, "tool_mgr", None)
+        if tool_mgr and getattr(tool_mgr, "clients", None):
+            for client in tool_mgr.clients:
+                try:
+                    await client.close()
+                except Exception as e:  # pragma: no cover
+                    logger.warning(
+                        "Error closing client %s: %s",
+                        getattr(client, "name", "<unknown>"),
+                        e,
+                    )
 
-        # Get connected clients from tool manager
-        for client in self.tool_mgr.clients:
-            try:
-                await client.close()
-            except Exception as e:
-                logger.warning(f"Error closing client {client.name}: {e}")
-
-    async def apply_prompt(self, name: str, args: dict[str, str]) -> list[dict]:
+    async def apply_prompt(
+        self, name: str, args: dict[str, str]
+    ) -> list[dict[str, Any]]:
         """Apply a parameterized prompt and return conversation messages."""
         if not self.tool_mgr:
-            raise RuntimeError("Tool manager not initialized")
+            raise InitializationError("Tool manager not initialized")
 
         res = await self.tool_mgr.get_prompt(name, args)
 

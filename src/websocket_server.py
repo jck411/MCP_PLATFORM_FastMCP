@@ -83,10 +83,24 @@ class WebSocketServer:
         self.chat_service = create_orchestrator(clients, llm_config, config, repo)
         self.repo = repo
         self.config = config
+        self.llm_config = llm_config  # Store for provider info
         self.app = self._create_app()
         self.active_connections: list[WebSocket] = []
         # Store conversation id per socket
         self.conversation_ids: dict[WebSocket, str] = {}
+
+    def _get_provider_info(self) -> dict[str, Any]:
+        """Get current provider and model information for frontend optimization."""
+        provider = self.llm_config.get("active", "unknown")
+        providers_config = self.llm_config.get("providers", {})
+        provider_config = providers_config.get(provider, {})
+        model = provider_config.get("model", "unknown")
+
+        return {
+            "provider": provider,
+            "model": model,
+            "orchestrator_type": type(self.chat_service).__name__
+        }
 
     def _create_app(self) -> FastAPI:
         """Create and configure FastAPI app."""
@@ -213,12 +227,18 @@ class WebSocketServer:
         logger.info(f"Received chat message: {user_message[:50]}...")
 
         try:
+            provider_info = self._get_provider_info()
             await websocket.send_text(
                 json.dumps(
                     {
                         "request_id": request_id,
                         "status": "processing",
-                        "chunk": {"metadata": {"user_message": user_message}},
+                        "chunk": {
+                            "metadata": {
+                                "user_message": user_message,
+                                "provider_info": provider_info
+                            }
+                        },
                     }
                 )
             )
@@ -315,10 +335,18 @@ class WebSocketServer:
             f"content={chat_message.content[:50]}..."
         )
 
+        # Get provider info for frontend optimization
+        provider_info = self._get_provider_info()
+
         # Convert chat service message to frontend format
         if chat_message.type == "text":
             # Only send text messages that aren't tool results
             if not chat_message.meta.get("tool_result"):
+                # Add provider info to metadata for frontend optimization
+                enhanced_metadata = {
+                    **chat_message.meta,
+                    "provider_info": provider_info
+                }
                 await websocket.send_text(
                     json.dumps(
                         {
@@ -327,7 +355,7 @@ class WebSocketServer:
                             "chunk": {
                                 "type": "text",
                                 "data": chat_message.content,
-                                "metadata": chat_message.meta,
+                                "metadata": enhanced_metadata,
                             },
                         }
                     )
@@ -349,6 +377,11 @@ class WebSocketServer:
             )
 
         elif chat_message.type == "error":
+            # Add provider info to error metadata for context
+            enhanced_error_metadata = {
+                **chat_message.meta,
+                "provider_info": provider_info
+            }
             await websocket.send_text(
                 json.dumps(
                     {
@@ -356,7 +389,7 @@ class WebSocketServer:
                         "status": "error",
                         "chunk": {
                             "error": chat_message.content,
-                            "metadata": chat_message.meta,
+                            "metadata": enhanced_error_metadata,
                         },
                     }
                 )
