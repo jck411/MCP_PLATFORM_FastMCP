@@ -25,9 +25,10 @@ from mcp import types
 
 from src.history.chat_store import ChatEvent, ChatRepository, ToolCall, Usage
 from src.history.persistence import ConversationPersistenceService
-from src.http_resilience import ResilientHttpClient, create_http_config_from_dict
 from src.mcp_services.prompting import MCPResourcePromptService
 from src.schema_manager import SchemaManager
+
+from .http_resilience import ResilientHttpClient, create_http_config_from_dict
 
 if TYPE_CHECKING:
     from src.main import MCPClient  # pragma: no cover

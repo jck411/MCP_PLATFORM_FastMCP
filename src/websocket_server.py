@@ -16,9 +16,8 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.anthropic_orchestrator import AnthropicOrchestrator
 from src.history.chat_store import ChatRepository
-from src.openai_orchestrator import OpenAIOrchestrator
+from src.llm_orchestrators import AnthropicOrchestrator, OpenAIOrchestrator
 
 # TYPE_CHECKING imports to avoid circular imports
 if TYPE_CHECKING:

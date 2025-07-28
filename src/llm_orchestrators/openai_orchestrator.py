@@ -12,24 +12,26 @@ OpenAI API compatibility:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 from collections.abc import AsyncGenerator
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 from mcp import types
 
 from src.history.chat_store import ChatEvent, ChatRepository, ToolCall, Usage
 from src.history.persistence import ConversationPersistenceService
-from src.http_resilience import ResilientHttpClient, create_http_config_from_dict
 from src.mcp_services.prompting import MCPResourcePromptService
+from src.schema_manager import SchemaManager
+
+from .http_resilience import ResilientHttpClient, create_http_config_from_dict
 
 if TYPE_CHECKING:
     from src.main import MCPClient
-
-from src.schema_manager import SchemaManager
 
 logger = logging.getLogger(__name__)
 
@@ -37,17 +39,49 @@ logger = logging.getLogger(__name__)
 MAX_TOOL_HOPS = 8
 
 
+class OrchestratorError(Exception):
+    """Base class for orchestrator errors."""
+
+
+class InitializationError(OrchestratorError):
+    """Raised when orchestrator is used before initialization."""
+
+
+class TransportError(OrchestratorError):
+    """Raised when HTTP/stream transport contracts are violated."""
+
+
+class UpstreamProtocolError(OrchestratorError):
+    """Raised when upstream API responses violate expected protocols."""
+
+
+class ToolExecutionError(OrchestratorError):
+    """Raised when tool execution fails."""
+
+
+@dataclass(slots=True)
 class ChatMessage:
     """
     Represents a chat message with metadata.
     """
+    mtype: Literal["text", "error"]
+    content: str
+    meta: dict[str, Any]
 
     def __init__(
-        self, mtype: str, content: str, meta: dict[str, Any] | None = None
+        self,
+        mtype: Literal["text", "error"],
+        content: str,
+        meta: dict[str, Any] | None = None
     ):
-        self.type = mtype
+        self.mtype = mtype
         self.content = content
         self.meta = meta if meta is not None else {}
+
+    @property
+    def type(self) -> str:
+        """Compatibility property for existing code."""
+        return self.mtype
 
 
 class OpenAIOrchestrator:
@@ -91,12 +125,12 @@ class OpenAIOrchestrator:
 
         # Validate required configuration
         if not self.api_key:
-            raise RuntimeError(
+            raise InitializationError(
                 f"Missing API key: set {self.active_name.upper()}_API_KEY or "
                 f"providers['{self.active_name}']['api_key']"
             )
         if not self.base_url:
-            raise RuntimeError("Missing base_url in provider config")
+            raise InitializationError("Missing base_url in provider config")
 
         # Create HTTP resilience configuration
         http_config = create_http_config_from_dict(llm_config)
@@ -138,59 +172,69 @@ class OpenAIOrchestrator:
             if self._ready.is_set():
                 return
 
-            # Connect to all clients and collect results
-            connection_results = await asyncio.gather(
-                *(c.connect() for c in self.clients), return_exceptions=True
-            )
+            try:
+                # Connect to all clients and collect results
+                connection_results = await asyncio.gather(
+                    *(c.connect() for c in self.clients), return_exceptions=True
+                )
 
-            # Filter out only successfully connected clients
-            connected_clients = []
-            for i, result in enumerate(connection_results):
-                if isinstance(result, Exception):
+                # Filter out only successfully connected clients
+                connected_clients = []
+                for i, result in enumerate(connection_results):
+                    if isinstance(result, Exception):
+                        client_name = self.clients[i].name
+                        logger.warning(
+                            f"Client '{client_name}' failed to connect: {result}"
+                        )
+                    else:
+                        connected_clients.append(self.clients[i])
+
+                if not connected_clients:
                     logger.warning(
-                        f"Client '{self.clients[i].name}' failed to connect: {result}"
+                        "No MCP clients connected - running with basic functionality"
                     )
                 else:
-                    connected_clients.append(self.clients[i])
+                    logger.info(
+                        f"Successfully connected to {len(connected_clients)} out of "
+                        f"{len(self.clients)} MCP clients"
+                    )
 
-            if not connected_clients:
-                logger.warning(
-                    "No MCP clients connected - running with basic functionality"
+                # Use connected clients for tool management (empty list is acceptable)
+                self.tool_mgr = SchemaManager(connected_clients)
+                await self.tool_mgr.initialize()
+
+                # Resource catalog & system prompt (MCP-only, provider-agnostic)
+                self.mcp_prompt = MCPResourcePromptService(
+                    self.tool_mgr, self.chat_conf
                 )
-            else:
+                await self.mcp_prompt.update_resource_catalog_on_availability()
+                self._system_prompt = await self.mcp_prompt.make_system_prompt()
+
                 logger.info(
-                    f"Successfully connected to {len(connected_clients)} out of "
-                    f"{len(self.clients)} MCP clients"
+                    "OpenAIOrchestrator ready: %d tools, %d resources, %d prompts",
+                    len(self.tool_mgr.get_mcp_tools()),
+                    len(self.mcp_prompt.resource_catalog if self.mcp_prompt else []),
+                    len(self.tool_mgr.list_available_prompts()),
                 )
 
-            # Use connected clients for tool management (empty list is acceptable)
-            self.tool_mgr = SchemaManager(connected_clients)
-            await self.tool_mgr.initialize()
+                logger.info(
+                    "Resource catalog: %s",
+                    (self.mcp_prompt.resource_catalog if self.mcp_prompt else []),
+                )
 
-            # Resource catalog & system prompt (MCP-only, provider-agnostic)
-            self.mcp_prompt = MCPResourcePromptService(self.tool_mgr, self.chat_conf)
-            await self.mcp_prompt.update_resource_catalog_on_availability()
-            self._system_prompt = await self.mcp_prompt.make_system_prompt()
+                # Configurable system prompt logging
+                if self.chat_conf.get("logging", {}).get("system_prompt", True):
+                    logger.info("System prompt being used:\n%s", self._system_prompt)
+                else:
+                    logger.debug("System prompt logging disabled in configuration")
 
-            logger.info(
-                "OpenAIOrchestrator ready: %d tools, %d resources, %d prompts",
-                len(self.tool_mgr.get_mcp_tools()),
-                len(self.mcp_prompt.resource_catalog if self.mcp_prompt else []),
-                len(self.tool_mgr.list_available_prompts()),
-            )
+                self._ready.set()
 
-            logger.info(
-                "Resource catalog: %s",
-                (self.mcp_prompt.resource_catalog if self.mcp_prompt else []),
-            )
-
-            # Configurable system prompt logging
-            if self.chat_conf.get("logging", {}).get("system_prompt", True):
-                logger.info("System prompt being used:\n%s", self._system_prompt)
-            else:
-                logger.debug("System prompt logging disabled in configuration")
-
-            self._ready.set()
+            except Exception as e:
+                logger.error(f"Failed to initialize OpenAI orchestrator: {e}")
+                raise InitializationError(
+                    f"Orchestrator initialization failed: {e}"
+                ) from e
 
     def _build_openai_request(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
@@ -234,31 +278,41 @@ class OpenAIOrchestrator:
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
     ) -> dict[str, Any]:
         """Make direct OpenAI API call with retry logic."""
-        payload = self._build_openai_request(messages, tools)
-        response = await self.http_client.post_json("/chat/completions", payload)
+        try:
+            payload = self._build_openai_request(messages, tools)
+            response = await self.http_client.post_json("/chat/completions", payload)
 
-        # For non-streaming, we expect an httpx.Response
-        if isinstance(response, httpx.Response):
-            return self._parse_openai_response(response.json())
+            # For non-streaming, we expect an httpx.Response
+            if isinstance(response, httpx.Response):
+                return self._parse_openai_response(response.json())
 
-        raise TypeError("Expected httpx.Response for non-streaming request")
+            raise TransportError("Expected httpx.Response for non-streaming request")
+
+        except Exception as e:
+            logger.error(f"OpenAI API call failed: {e}")
+            raise UpstreamProtocolError(f"API call failed: {e}") from e
 
     async def _stream_openai_api(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
     ) -> AsyncGenerator[dict[str, Any]]:
         """Stream responses from OpenAI API with retry logic."""
-        payload = self._build_openai_request(messages, tools)
-        response_gen = await self.http_client.post_json(
-            "/chat/completions", payload, stream=True
-        )
+        try:
+            payload = self._build_openai_request(messages, tools)
+            response_gen = await self.http_client.post_json(
+                "/chat/completions", payload, stream=True
+            )
 
-        # For streaming, we expect an AsyncGenerator
-        if not isinstance(response_gen, httpx.Response):
-            async for chunk in response_gen:
-                yield chunk
-            return
+            # For streaming, we expect an AsyncGenerator
+            if not isinstance(response_gen, httpx.Response):
+                async for chunk in response_gen:
+                    yield chunk
+                return
 
-        raise TypeError("Expected AsyncGenerator for streaming request")
+            raise TransportError("Expected AsyncGenerator for streaming request")
+
+        except Exception as e:
+            logger.error(f"OpenAI streaming API call failed: {e}")
+            raise UpstreamProtocolError(f"Streaming API call failed: {e}") from e
 
     async def _build_conversation_history(
         self, conversation_id: str
@@ -443,26 +497,36 @@ class OpenAIOrchestrator:
         current_tool_calls: list[dict[str, Any]] = []
         finish_reason: str | None = None
 
-        async for chunk in self._stream_openai_api(conv, tools_payload):
-            if "choices" not in chunk or not chunk["choices"]:
-                continue
+        try:
+            async for chunk in self._stream_openai_api(conv, tools_payload):
+                if "choices" not in chunk or not chunk["choices"]:
+                    continue
 
-            choice = chunk["choices"][0]
-            delta = choice.get("delta", {})
+                choice = chunk["choices"][0]
+                delta = choice.get("delta", {})
 
-            # Handle content streaming
-            if content := delta.get("content"):
-                message_buffer += content
-                yield ChatMessage("text", content, {"type": "delta"})
+                # Handle content streaming
+                if content := delta.get("content"):
+                    message_buffer += content
+                    yield ChatMessage("text", content, {"type": "delta"})
 
-            # Handle tool calls streaming
-            if tool_calls := delta.get("tool_calls"):
-                logger.info(f"Received tool call delta: {tool_calls}")
-                self._accumulate_tool_calls(current_tool_calls, tool_calls)
+                # Handle tool calls streaming
+                if tool_calls := delta.get("tool_calls"):
+                    logger.info(f"Received tool call delta: {tool_calls}")
+                    self._accumulate_tool_calls(current_tool_calls, tool_calls)
 
-            # Handle finish reason
-            if "finish_reason" in choice:
-                finish_reason = choice["finish_reason"]
+                # Handle finish reason
+                if "finish_reason" in choice:
+                    finish_reason = choice["finish_reason"]
+
+        except Exception as e:
+            logger.error(f"Streaming error: {e}")
+            yield ChatMessage(
+                "error",
+                f"Streaming interrupted: {e!s}",
+                {"type": "error", "recoverable": True},
+            )
+            return
 
         # Yield complete assistant message as final item
         assistant_message = {
@@ -525,9 +589,70 @@ class OpenAIOrchestrator:
 
         logger.info(f"Executing {len(calls)} tool calls")
 
+        # Cycle detection to prevent infinite loops
+        seen_calls: set[tuple[str, str]] = set()
+
         for call in calls:
             tool_name = call["function"]["name"]
-            args = json.loads(call["function"]["arguments"] or "{}")
+            try:
+                args = json.loads(call["function"]["arguments"] or "{}")
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse tool arguments: {e}")
+                error_msg = f"Error: Invalid JSON in tool arguments: {e}"
+
+                # Persist error as tool result
+                tool_result_event = ChatEvent(
+                    conversation_id=conversation_id,
+                    type="tool_result",
+                    role="tool",
+                    content=error_msg,
+                    extra={
+                        "user_request_id": request_id,
+                        "tool_call_id": call["id"],
+        "tool_name": tool_name,
+                        "error": "json_parse_error"
+                    }
+                )
+                await self.repo.add_event(tool_result_event)
+
+                conv.append({
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "content": error_msg,
+                })
+                continue
+
+            # Check for cycles
+            call_key = (tool_name, json.dumps(args, sort_keys=True))
+            if call_key in seen_calls:
+                logger.warning(f"Cycle detected for tool call: {tool_name}")
+                error_msg = (
+                    f"⚠️ Cycle detected: tool '{tool_name}' called with same arguments"
+                )
+
+                # Persist cycle detection as tool result
+                tool_result_event = ChatEvent(
+                    conversation_id=conversation_id,
+                    type="tool_result",
+                    role="tool",
+                    content=error_msg,
+                    extra={
+                        "user_request_id": request_id,
+                        "tool_call_id": call["id"],
+                        "tool_name": tool_name,
+                        "error": "cycle_detected"
+                    }
+                )
+                await self.repo.add_event(tool_result_event)
+
+                conv.append({
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "content": error_msg,
+                })
+                continue
+
+            seen_calls.add(call_key)
 
             # 1. Persist the tool call event
             tool_call_event = ChatEvent(
@@ -548,11 +673,13 @@ class OpenAIOrchestrator:
 
             logger.info(f"Calling tool '{tool_name}' with args: {args}")
 
-            # 2. Execute the tool
-            result = await self.tool_mgr.call_tool(tool_name, args)
-
-            # Handle structured content
-            content = self._pluck_content(result)
+            # 2. Execute the tool with error handling
+            try:
+                result = await self.tool_mgr.call_tool(tool_name, args)
+                content = self._pluck_content(result)
+            except Exception as e:
+                logger.error(f"Tool execution failed for '{tool_name}': {e}")
+                content = f"Error executing tool '{tool_name}': {e}"
 
             # 3. Persist the tool result event
             tool_result_event = ChatEvent(
@@ -822,18 +949,22 @@ class OpenAIOrchestrator:
 
     async def cleanup(self) -> None:
         """Clean up resources by closing all connected MCP clients and HTTP client."""
-        if self.http_client:
-            await self.http_client.close()
+        # Clean up HTTP client with error suppression
+        if getattr(self, "http_client", None):
+            with contextlib.suppress(Exception):
+                await self.http_client.close()
 
         if not self.tool_mgr:
-            raise RuntimeError("Tool manager not initialized")
+            logger.warning("Tool manager not initialized during cleanup")
+            return
 
-        # Get connected clients from tool manager
+        # Get connected clients from tool manager and close with error handling
         for client in self.tool_mgr.clients:
-            try:
+            with contextlib.suppress(Exception):
                 await client.close()
-            except Exception as e:
-                logger.warning(f"Error closing client {client.name}: {e}")
+                logger.debug(f"Closed client: {client.name}")
+
+        logger.info("OpenAI orchestrator cleanup completed")
 
     async def apply_prompt(self, name: str, args: dict[str, str]) -> list[dict]:
         """Apply a parameterized prompt and return conversation messages."""
