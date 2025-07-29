@@ -5,7 +5,7 @@ This version fixes duplicate assistant replies by distinguishing between
 streaming deltas and final responses. It uses event.partial and
 event.is_final_response() from the ADK to decide when to stream text
 and when to finalize. Tool calls and results are persisted separately,
-while user‑facing text is deduplicated.
+while user-facing text is deduplicated.
 """
 
 from __future__ import annotations
@@ -20,12 +20,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 import google.genai.types as genai_types
-
 from google.adk.agents import LlmAgent
 from google.adk.artifacts import InMemoryArtifactService
 from google.adk.events import Event
 from google.adk.models import Gemini
 from google.adk.runners import Runner
+
 try:
     from google.adk.agents.run_config import RunConfig, StreamingMode
 except ImportError:
@@ -52,6 +52,13 @@ logger = logging.getLogger(__name__)
 
 MAX_TOOL_HOPS = 8
 MAX_TEXT_DELTA_SIZE = 10_000
+MAX_LOG_MESSAGE_LENGTH = 100
+
+
+class InitializationError(Exception):
+    """Raised when initialization of the Gemini ADK orchestrator fails."""
+
+    pass
 
 
 @dataclass(slots=True)
@@ -172,14 +179,18 @@ class GeminiAdkOrchestrator:
 
                 self.tool_mgr = SchemaManager(connected_clients)
                 await self.tool_mgr.initialize()
-                self.mcp_prompt = MCPResourcePromptService(self.tool_mgr, self.chat_conf)
+                self.mcp_prompt = MCPResourcePromptService(
+                    self.tool_mgr, self.chat_conf
+                )
                 await self.mcp_prompt.update_resource_catalog_on_availability()
                 self._system_prompt = await self.mcp_prompt.make_system_prompt()
 
                 logger.info(
                     "GeminiAdkOrchestrator: %d MCP tools (prompt-side), %d resources.",
                     len(self.tool_mgr.get_mcp_tools()),
-                    len(self.mcp_prompt.resource_catalog if self.mcp_prompt else []),
+                    len(
+                        self.mcp_prompt.resource_catalog if self.mcp_prompt else []
+                    ),
                 )
             except Exception as e:
                 logger.warning(
@@ -189,10 +200,13 @@ class GeminiAdkOrchestrator:
             # Build ADK MCP toolsets
             try:
                 mcp_config = self._load_mcp_servers_config()
-                self._mcp_toolsets = self._build_adk_mcp_toolsets_from_config(mcp_config)
+                self._mcp_toolsets = self._build_adk_mcp_toolsets_from_config(
+                    mcp_config
+                )
                 if not self._mcp_toolsets:
                     logger.warning(
-                        "No ADK MCP toolsets configured. Proceeding without external tools."
+                        "No ADK MCP toolsets configured. "
+                        "Proceeding without external tools."
                     )
                 else:
                     logger.info(
@@ -248,7 +262,9 @@ class GeminiAdkOrchestrator:
                 args = s.get("args") or []
                 env = s.get("env") or {}
                 if not cmd:
-                    raise InitializationError(f"MCP stdio server '{name}' missing 'command'")
+                    raise InitializationError(
+                        f"MCP stdio server '{name}' missing 'command'"
+                    )
                 server_params = StdioServerParameters(command=cmd, args=args, env=env)
                 params = StdioConnectionParams(server_params=server_params)
                 toolsets.append(MCPToolset(connection_params=params))
@@ -260,18 +276,22 @@ class GeminiAdkOrchestrator:
                 params = SseConnectionParams(url=url, headers=headers)
                 toolsets.append(MCPToolset(connection_params=params))
             else:
-                raise InitializationError(f"Unknown MCP server kind '{kind}' for '{name}'")
+                raise InitializationError(
+                    f"Unknown MCP server kind '{kind}' for '{name}'"
+                )
         return toolsets
 
     def _load_mcp_servers_config(self) -> dict[str, Any]:
-        """Load MCP servers config from servers_config.json and convert to ADK format."""
+        """Load MCP servers config from servers_config.json and convert to ADK."""
         try:
-            config_path = os.path.join(os.path.dirname(__file__), "..", "servers_config.json")
+            config_path = os.path.join(
+                os.path.dirname(__file__), "..", "servers_config.json"
+            )
             config_path = os.path.abspath(config_path)
             if not os.path.exists(config_path):
                 logger.warning(f"MCP servers config not found at {config_path}")
                 return {"servers": []}
-            with open(config_path, "r") as f:
+            with open(config_path) as f:
                 config_data = json.load(f)
             mcp_servers = config_data.get("mcpServers", {})
             adk_servers: list[dict[str, Any]] = []
@@ -282,7 +302,9 @@ class GeminiAdkOrchestrator:
                 args = server_config.get("args", [])
                 cwd = server_config.get("cwd")
                 if not command:
-                    logger.warning(f"MCP server '{server_name}' missing command, skipping")
+                    logger.warning(
+                        f"MCP server '{server_name}' missing command, skipping"
+                    )
                     continue
                 adk_server: dict[str, Any] = {
                     "name": server_name,
@@ -403,13 +425,13 @@ class GeminiAdkOrchestrator:
     # Streaming processing (bootstrap)
     # ---------------------------------------------------------------------
 
-    async def _process_events_bootstrap(
+    async def _process_events_bootstrap(  # noqa: PLR0912
         self,
         user_id: str,
         conversation_id: str,
         request_id: str,
         new_message: genai_types.Content,
-    ) -> AsyncGenerator[ChatMessage, None]:
+    ) -> AsyncGenerator[ChatMessage]:
         """
         Process events using the bootstrap pattern (ADK chooses a session_id).
 
@@ -467,27 +489,33 @@ class GeminiAdkOrchestrator:
                 if not partial_buffer:
                     if final_current_text:
                         if len(final_current_text) > MAX_TEXT_DELTA_SIZE:
-                            final_current_text = final_current_text[:MAX_TEXT_DELTA_SIZE]
+                            final_current_text = final_current_text[
+                                :MAX_TEXT_DELTA_SIZE
+                            ]
                         yield ChatMessage("text", final_current_text, {"type": "final"})
-                else:
-                    if final_current_text and final_current_text.strip() != partial_buffer.strip():
-                        if len(final_current_text) > MAX_TEXT_DELTA_SIZE:
-                            final_current_text = final_current_text[:MAX_TEXT_DELTA_SIZE]
-                        yield ChatMessage("text", final_current_text, {"type": "final"})
+                elif (
+                    final_current_text
+                    and final_current_text.strip() != partial_buffer.strip()
+                ):
+                    if len(final_current_text) > MAX_TEXT_DELTA_SIZE:
+                        final_current_text = final_current_text[
+                            :MAX_TEXT_DELTA_SIZE
+                        ]
+                    yield ChatMessage("text", final_current_text, {"type": "final"})
                 partial_buffer = ""
 
     # ---------------------------------------------------------------------
     # Streaming processing (direct)
     # ---------------------------------------------------------------------
 
-    async def _process_events_direct(
+    async def _process_events_direct(  # noqa: PLR0912
         self,
         user_id: str,
         adk_session_id: str,
         conversation_id: str,
         request_id: str,
         new_message: genai_types.Content,
-    ) -> AsyncGenerator[ChatMessage, None]:
+    ) -> AsyncGenerator[ChatMessage]:
         """
         Process events using the direct session pattern (predetermined session_id).
 
@@ -509,6 +537,8 @@ class GeminiAdkOrchestrator:
             except Exception as e:
                 logger.warning(f"Could not configure ADK streaming: {e}")
         # Obtain event stream
+        if not self._runner:
+            raise InitializationError("ADK runner is not initialized")
         if run_config:
             event_stream = self._runner.run_async(
                 user_id=user_id,
@@ -554,25 +584,31 @@ class GeminiAdkOrchestrator:
                 if not partial_buffer:
                     if final_current_text:
                         if len(final_current_text) > MAX_TEXT_DELTA_SIZE:
-                            final_current_text = final_current_text[:MAX_TEXT_DELTA_SIZE]
+                            final_current_text = final_current_text[
+                                :MAX_TEXT_DELTA_SIZE
+                            ]
                         yield ChatMessage("text", final_current_text, {"type": "final"})
-                else:
-                    if final_current_text and final_current_text.strip() != partial_buffer.strip():
-                        if len(final_current_text) > MAX_TEXT_DELTA_SIZE:
-                            final_current_text = final_current_text[:MAX_TEXT_DELTA_SIZE]
-                        yield ChatMessage("text", final_current_text, {"type": "final"})
+                elif (
+                    final_current_text
+                    and final_current_text.strip() != partial_buffer.strip()
+                ):
+                    if len(final_current_text) > MAX_TEXT_DELTA_SIZE:
+                        final_current_text = final_current_text[
+                            :MAX_TEXT_DELTA_SIZE
+                        ]
+                    yield ChatMessage("text", final_current_text, {"type": "final"})
                 partial_buffer = ""
 
     # ---------------------------------------------------------------------
     # Public API: process_message (streaming)
     # ---------------------------------------------------------------------
 
-    async def process_message(
+    async def process_message(  # noqa: PLR0912
         self,
         conversation_id: str,
         user_msg: str,
         request_id: str,
-    ) -> AsyncGenerator[ChatMessage, None]:
+    ) -> AsyncGenerator[ChatMessage]:
         """
         Streaming response handler.
 
@@ -586,9 +622,16 @@ class GeminiAdkOrchestrator:
             raise InitializationError("ADK runner/agent not initialized")
 
         logger.info(
-            "GeminiAdkOrchestrator.process_message called: conversation_id=%s, msg='%s'",
+            (
+                "GeminiAdkOrchestrator.process_message called: "
+                "conversation_id=%s, msg='%s'"
+            ),
             conversation_id,
-            user_msg[:100] + "..." if len(user_msg) > 100 else user_msg,
+            (
+                user_msg[:MAX_LOG_MESSAGE_LENGTH] + "..."
+                if len(user_msg) > MAX_LOG_MESSAGE_LENGTH
+                else user_msg
+            ),
         )
 
         # Persist user message idempotently
@@ -635,7 +678,8 @@ class GeminiAdkOrchestrator:
                             final_text_candidate = msg.content
                             partial_accumulation = ""
                         else:
-                            # treat other text types (warnings, cached) as part of accumulation
+                            # treat other text types (warnings, cached)
+                            # as part of accumulation
                             partial_accumulation += msg.content
             else:
                 # Direct: predetermined session_id
@@ -662,7 +706,9 @@ class GeminiAdkOrchestrator:
 
         # Determine the final assistant text to persist
         full_assistant_text = (
-            final_text_candidate if final_text_candidate is not None else partial_accumulation
+            final_text_candidate
+            if final_text_candidate is not None
+            else partial_accumulation
         )
         # Persist final assistant message
         await self.persist.persist_final_assistant_message(
@@ -751,7 +797,11 @@ class GeminiAdkOrchestrator:
                         content_str = json.dumps(content, ensure_ascii=False)
                     except Exception:
                         content_str = str(content)
-                results.append({"call_id": call_id, "name": name, "content": content_str})
+                results.append({
+                    "call_id": call_id,
+                    "name": name,
+                    "content": content_str,
+                })
         except Exception:
             pass
         return results
