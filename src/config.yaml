@@ -79,7 +79,7 @@ llm:
 
     openrouter:
       base_url: "https://openrouter.ai/api/v1"
-      model: "anthropic/claude-3-sonnet"  # or other available models
+      model: "moonshotai/kimi-k2"  # or other available models
       temperature: 0.7
       max_tokens: 4096
       top_p: 1.0
