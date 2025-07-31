@@ -156,6 +156,8 @@ class WebSocketServer:
                 # Handle message based on action
                 if message_data.get("action") == "chat":
                     await self._handle_chat_message(websocket, message_data)
+                elif message_data.get("action") == "clear_session":
+                    await self._handle_clear_session(websocket, message_data)
                 else:
                     # Unknown message format
                     logger.warning(f"Unknown message format: {message_data}")
@@ -166,7 +168,7 @@ class WebSocketServer:
                                 "chunk": {
                                     "error": (
                                         "Unknown message format. "
-                                        "Expected 'action': 'chat'"
+                                        "Expected 'action': 'chat' or 'clear_session'"
                                     )
                                 },
                             }
@@ -276,6 +278,59 @@ class WebSocketServer:
 
         except Exception as e:
             logger.error(f"Error processing chat message: {e}")
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "status": "error",
+                        "chunk": {"error": str(e)},
+                    }
+                )
+            )
+
+    async def _handle_clear_session(
+        self, websocket: WebSocket, message_data: dict[str, Any]
+    ):
+        """Handle a clear session request from the frontend."""
+        request_id = message_data.get("request_id")
+        if not request_id:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "chunk": {"error": "request_id is required"},
+                    }
+                )
+            )
+            return
+
+        try:
+            # Generate a new conversation ID for this WebSocket connection
+            new_conversation_id = str(uuid.uuid4())
+            self.conversation_ids[websocket] = new_conversation_id
+
+            logger.info(
+                f"Session cleared for websocket, "
+                f"new conversation_id: {new_conversation_id}"
+            )
+
+            # Send success response
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "status": "complete",
+                        "chunk": {
+                            "type": "session_cleared",
+                            "data": "Session cleared successfully",
+                            "metadata": {"new_conversation_id": new_conversation_id},
+                        },
+                    }
+                )
+            )
+
+        except Exception as e:
+            logger.error(f"Error clearing session: {e}")
             await websocket.send_text(
                 json.dumps(
                     {

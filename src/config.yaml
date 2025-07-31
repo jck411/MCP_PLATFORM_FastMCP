@@ -47,7 +47,7 @@ chat:
 
 # LLM Configuration - Just change the 'active' provider!
 llm:
-  active: "openai_responses"  # Change this to: openai, groq, openrouter, anthropic, azure, gemini, openai_responses
+  active: "openrouter"  # Change this to: openai, groq, openrouter, anthropic, azure, gemini, openai_responses
 
   # HTTP client configuration
   http:
@@ -86,10 +86,14 @@ llm:
 
     openrouter:
       base_url: "https://openrouter.ai/api/v1"
-      model: "moonshotai/kimi-k2"  # or other available models
+      model: "anthropic/claude-3.7-sonnet:thinking"  # or other available models
       temperature: 0.7
       max_tokens: 4096
       top_p: 1.0
+      # Reasoning/thinking configuration for supported models
+      reasoning:
+        effort: "medium"  # "low", "medium", "high" or use max_tokens: 2000
+        # exclude: false  # Set to true to use reasoning but not include in response
 
     anthropic:
       base_url: "https://api.anthropic.com/v1"

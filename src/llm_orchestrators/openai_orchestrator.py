@@ -262,13 +262,72 @@ class OpenAIOrchestrator:
                 })
             payload["tools"] = openai_tools
 
+        # Add reasoning/thinking support for OpenRouter
+        if self._supports_reasoning():
+            reasoning_config = self._get_reasoning_config()
+            if reasoning_config:
+                payload["reasoning"] = reasoning_config
+
         return payload
+
+    def _supports_reasoning(self) -> bool:
+        """Check if current provider/model supports reasoning/thinking blocks."""
+        # Only enable reasoning for OpenRouter or specific base URLs
+        base_url_lower = self.base_url.lower()
+        if "openrouter.ai" in base_url_lower:
+            return True
+
+        # Enable for specific models that support reasoning
+        model_lower = self.model.lower()
+        reasoning_models = ["o1", "o3", "o4", "deepseek", "claude", "qwen", "r1"]
+        return any(rm in model_lower for rm in reasoning_models)
+
+    def _get_reasoning_config(self) -> dict[str, Any] | None:
+        """Get reasoning configuration from provider settings."""
+        if not self._supports_reasoning():
+            return None
+
+        # Check if reasoning is explicitly configured in provider config
+        reasoning_config = self.provider_cfg.get("reasoning", {})
+
+        # If no explicit config, use default reasoning settings
+        if not reasoning_config:
+            # Use moderate reasoning by default for thinking
+            reasoning_config = {"effort": "medium"}
+
+        # Log that we're enabling reasoning
+        if reasoning_config:
+            logger.info(
+                f"Enabling reasoning/thinking for model '{self.model}': "
+                f"{reasoning_config}"
+            )
+
+        return reasoning_config
+
+    def _log_reasoning(self, reasoning: str, context: str) -> None:
+        """Log reasoning/thinking content if configured."""
+        if not self.chat_conf.get("logging", {}).get("llm_replies", False):
+            return
+
+        # Truncate reasoning if configured
+        logging_config = self.chat_conf.get("logging", {})
+        truncate_length = logging_config.get("llm_reply_truncate_length", 500)
+        if reasoning and len(reasoning) > truncate_length:
+            reasoning = reasoning[:truncate_length] + "..."
+
+        logger.info(f"🧠 Reasoning/Thinking ({context}): {reasoning}")
 
     def _parse_openai_response(self, data: dict[str, Any]) -> dict[str, Any]:
         """Parse OpenAI API response."""
         choice = data["choices"][0]
+        message = choice["message"]
+
+        # Log reasoning/thinking if present
+        if message.get("reasoning"):
+            self._log_reasoning(message["reasoning"], "Non-streaming response")
+
         return {
-            "message": choice["message"],
+            "message": message,
             "finish_reason": choice.get("finish_reason"),
             "usage": data.get("usage"),
             "model": data.get("model", self.model),
@@ -496,6 +555,7 @@ class OpenAIOrchestrator:
         message_buffer = ""
         current_tool_calls: list[dict[str, Any]] = []
         finish_reason: str | None = None
+        reasoning_buffer = ""
 
         try:
             async for chunk in self._stream_openai_api(conv, tools_payload):
@@ -509,6 +569,11 @@ class OpenAIOrchestrator:
                 if content := delta.get("content"):
                     message_buffer += content
                     yield ChatMessage("text", content, {"type": "delta"})
+
+                # Handle reasoning streaming (OpenRouter/thinking models)
+                if reasoning := delta.get("reasoning"):
+                    reasoning_buffer += reasoning
+                    # Don't yield reasoning content to user, just collect for logging
 
                 # Handle tool calls streaming
                 if tool_calls := delta.get("tool_calls"):
@@ -527,6 +592,10 @@ class OpenAIOrchestrator:
                 {"type": "error", "recoverable": True},
             )
             return
+
+        # Log accumulated reasoning if present
+        if reasoning_buffer:
+            self._log_reasoning(reasoning_buffer, "Streaming response")
 
         # Yield complete assistant message as final item
         assistant_message = {
@@ -884,6 +953,7 @@ class OpenAIOrchestrator:
         message = reply.get("message", {})
         content = message.get("content", "")
         tool_calls = message.get("tool_calls", [])
+        reasoning = message.get("reasoning", "")
 
         # Truncate content if configured
         logging_config = self.chat_conf.get("logging", {})
@@ -892,6 +962,13 @@ class OpenAIOrchestrator:
             content = content[:truncate_length] + "..."
 
         log_parts = [f"LLM Reply ({context}):"]
+
+        # Log reasoning first if present (separate from main content)
+        if reasoning:
+            reasoning_truncated = reasoning
+            if len(reasoning) > truncate_length:
+                reasoning_truncated = reasoning[:truncate_length] + "..."
+            log_parts.append(f"🧠 Reasoning: {reasoning_truncated}")
 
         if content:
             log_parts.append(f"Content: {content}")
