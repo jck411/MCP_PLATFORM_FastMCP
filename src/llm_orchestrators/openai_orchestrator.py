@@ -16,6 +16,7 @@ import contextlib
 import json
 import logging
 import os
+import uuid
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -634,7 +635,7 @@ class OpenAIOrchestrator:
                 })
 
             idx = tool_call.get("index", 0)
-            if "id" in tool_call:
+            if "id" in tool_call and tool_call["id"] is not None:
                 current_tool_calls[idx]["id"] = tool_call["id"]
             if "function" in tool_call:
                 func = tool_call["function"]
@@ -663,6 +664,9 @@ class OpenAIOrchestrator:
 
         for call in calls:
             tool_name = call["function"]["name"]
+            # Ensure tool call ID is valid (not None or empty)
+            tool_call_id = call.get("id") or f"tool_call_{uuid.uuid4().hex[:8]}"
+
             try:
                 args = json.loads(call["function"]["arguments"] or "{}")
             except json.JSONDecodeError as e:
@@ -677,7 +681,7 @@ class OpenAIOrchestrator:
                     content=error_msg,
                     extra={
                         "user_request_id": request_id,
-                        "tool_call_id": call["id"],
+                        "tool_call_id": tool_call_id,
         "tool_name": tool_name,
                         "error": "json_parse_error"
                     }
@@ -686,7 +690,7 @@ class OpenAIOrchestrator:
 
                 conv.append({
                     "role": "tool",
-                    "tool_call_id": call["id"],
+                    "tool_call_id": tool_call_id,
                     "content": error_msg,
                 })
                 continue
@@ -707,7 +711,7 @@ class OpenAIOrchestrator:
                     content=error_msg,
                     extra={
                         "user_request_id": request_id,
-                        "tool_call_id": call["id"],
+                        "tool_call_id": tool_call_id,
                         "tool_name": tool_name,
                         "error": "cycle_detected"
                     }
@@ -716,7 +720,7 @@ class OpenAIOrchestrator:
 
                 conv.append({
                     "role": "tool",
-                    "tool_call_id": call["id"],
+                    "tool_call_id": tool_call_id,
                     "content": error_msg,
                 })
                 continue
@@ -729,13 +733,13 @@ class OpenAIOrchestrator:
                 type="tool_call",
                 role="assistant",  # Tool calls are initiated by assistant
                 tool_calls=[ToolCall(
-                    id=call["id"],
+                    id=tool_call_id,
                     name=tool_name,
                     arguments=args
                 )],
                 extra={
                     "user_request_id": request_id,
-                    "tool_call_id": call["id"]
+                    "tool_call_id": tool_call_id
                 }
             )
             await self.repo.add_event(tool_call_event)
@@ -758,7 +762,7 @@ class OpenAIOrchestrator:
                 content=content,
                 extra={
                     "user_request_id": request_id,
-                    "tool_call_id": call["id"],
+                    "tool_call_id": tool_call_id,
                     "tool_name": tool_name
                 }
             )
@@ -770,7 +774,7 @@ class OpenAIOrchestrator:
             conv.append(
                 {
                     "role": "tool",
-                    "tool_call_id": call["id"],
+                    "tool_call_id": tool_call_id,
                     "content": content,
                 }
             )
@@ -913,6 +917,8 @@ class OpenAIOrchestrator:
             for call in calls:
                 tool_name = call["function"]["name"]
                 args = json.loads(call["function"]["arguments"] or "{}")
+                # Ensure tool call ID is valid (not None or empty)
+                tool_call_id = call.get("id") or f"tool_call_{uuid.uuid4().hex[:8]}"
 
                 result = await self.tool_mgr.call_tool(tool_name, args)
                 content = self._pluck_content(result)
@@ -920,7 +926,7 @@ class OpenAIOrchestrator:
                 conv.append(
                     {
                         "role": "tool",
-                        "tool_call_id": call["id"],
+                        "tool_call_id": tool_call_id,
                         "content": content,
                     }
                 )

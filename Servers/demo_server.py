@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 
 # Tool configuration - easily toggle tools on/off
@@ -18,6 +20,7 @@ TOOL_CONFIG = {
     "advanced_math": True,
     "conversation_prompts": False,
     "desktop_resources": True,
+    "openrouter_tools": True,
 }
 
 # Create server
@@ -90,6 +93,101 @@ if TOOL_CONFIG["conversation_prompts"]:
             "follow-up questions that could help continue or deepen "
             "the discussion."
         )
+
+
+# OpenRouter tools
+if TOOL_CONFIG["openrouter_tools"]:
+    @mcp.tool()
+    async def get_openrouter_models() -> dict[str, Any]:
+        """
+        Fetch all available models from OpenRouter API.
+
+        Returns a dictionary containing:
+        - data: List of all available models with details like id, name,
+          description, pricing, etc.
+        - total_count: Total number of available models
+        """
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get("https://openrouter.ai/api/v1/models")
+                response.raise_for_status()
+
+                models_data = response.json()
+
+                if "data" in models_data:
+                    return {
+                        "data": models_data["data"],
+                        "total_count": len(models_data["data"]),
+                        "status": "success"
+                    }
+
+                return {
+                    "error": "Unexpected response format from OpenRouter API",
+                    "status": "error"
+                }
+
+        except httpx.HTTPError as e:
+            return {
+                "error": f"HTTP error occurred: {e!s}",
+                "status": "error"
+            }
+        except Exception as e:
+            return {
+                "error": f"An error occurred: {e!s}",
+                "status": "error"
+            }
+
+    @mcp.tool()
+    async def search_openrouter_models(
+        query: str,
+        limit: int = 10
+    ) -> dict[str, Any]:
+        """
+        Search OpenRouter models by name or description.
+
+        Args:
+            query: Search term to look for in model names and descriptions
+            limit: Maximum number of results to return (default: 10)
+
+        Returns:
+            Dictionary containing matching models and search metadata
+        """
+        try:
+            # First get all models
+            models_response = await get_openrouter_models()
+
+            if models_response.get("status") == "error":
+                return models_response
+
+            models = models_response["data"]
+            query_lower = query.lower()
+
+            # Search in model names and descriptions
+            matching_models = []
+            for model in models:
+                name_match = query_lower in model.get("name", "").lower()
+                desc_match = query_lower in model.get("description", "").lower()
+                id_match = query_lower in model.get("id", "").lower()
+
+                if name_match or desc_match or id_match:
+                    matching_models.append(model)
+
+                if len(matching_models) >= limit:
+                    break
+
+            return {
+                "data": matching_models,
+                "query": query,
+                "total_matches": len(matching_models),
+                "limit": limit,
+                "status": "success"
+            }
+
+        except Exception as e:
+            return {
+                "error": f"Search error: {e!s}",
+                "status": "error"
+            }
 
 
 if __name__ == "__main__":
