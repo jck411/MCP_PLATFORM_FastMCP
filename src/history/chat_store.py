@@ -53,6 +53,7 @@ class Usage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    reasoning_tokens: int = 0  # For reasoning models like o3
 
 class ChatEvent(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))

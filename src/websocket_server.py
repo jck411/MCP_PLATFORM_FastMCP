@@ -17,7 +17,11 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.history.chat_store import ChatRepository
-from src.llm_orchestrators import AnthropicOrchestrator, OpenAIOrchestrator
+from src.llm_orchestrators import (
+    AnthropicOrchestrator,
+    OpenAIOrchestrator,
+    OpenAIResponsesOrchestrator,
+)
 from src.llm_orchestrators.gemini_orchestrator import GeminiAdkOrchestrator
 
 # TYPE_CHECKING imports to avoid circular imports
@@ -32,7 +36,12 @@ def create_orchestrator(
     llm_config: dict[str, Any],
     config: dict[str, Any],
     repo: ChatRepository,
-) -> OpenAIOrchestrator | AnthropicOrchestrator | GeminiAdkOrchestrator:
+) -> (
+    OpenAIOrchestrator
+    | AnthropicOrchestrator
+    | GeminiAdkOrchestrator
+    | OpenAIResponsesOrchestrator
+):
     """
     Factory function to create the appropriate orchestrator based on config.
 
@@ -54,12 +63,15 @@ def create_orchestrator(
         return AnthropicOrchestrator(clients, llm_config, config, repo)
     if active_provider == "gemini":
         return GeminiAdkOrchestrator(clients, llm_config, config, repo)
+    if active_provider == "openai_responses":
+        return OpenAIResponsesOrchestrator(clients, llm_config, config, repo)
     if active_provider in ("openai", "groq", "openrouter", "azure"):
         return OpenAIOrchestrator(clients, llm_config, config, repo)
 
     raise ValueError(
         f"Unsupported LLM provider: '{active_provider}'. "
-        f"Supported providers: openai, groq, openrouter, azure, anthropic, gemini"
+        f"Supported providers: openai, openai_responses, groq, openrouter, "
+        f"azure, anthropic, gemini"
     )
 
 

@@ -61,6 +61,7 @@ class Configuration:
         # Map provider names to environment variable names
         provider_key_map = {
             "openai": "OPENAI_API_KEY",
+            "openai_responses": "OPENAI_API_KEY",  # Uses same OpenAI API key
             "groq": "GROQ_API_KEY",
             "anthropic": "ANTHROPIC_API_KEY",
             "openrouter": "OPENROUTER_API_KEY",
